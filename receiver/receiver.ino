@@ -21,32 +21,44 @@
 //   - Each packet carries raw ADC readings of A0-A2. SENSORS in config.h says
 //     which are fitted and how to convert them; the decision uses the average
 //     of the fitted sensors, leaving out any reading outside
-//     RAW_VALID_MIN-RAW_VALID_MAX as faulty.
-//   - Average < DRY_THRESHOLD_PCT and at least
-//     MIN_HOURS_BETWEEN_WATERING since the last watering -> water.
-//   - MAX_DAYS_WITHOUT_WATER since the last watering -> water, reading or not.
-//   - Watering = relay on for WATER_DURATION_MIN, then off.
-//   - The counter is saved to flash hourly, so a power cut loses at most an
-//     hour plus the outage.
+//     RAW_VALID_MIN-RAW_VALID_MAX as faulty. Each sensor's readings are
+//     averaged over DECISION_WINDOW_S and one decision is made per window.
+//   - The controller only checks the probe on the hour, so watering is queued
+//     and played back at the next X:59:30 (WATER_LEAD_S before the hour, in
+//     UTC from world time): relay DRY for WATER_DURATION_MIN, then off. It
+//     counts as a watering only once that hold completes.
+//   - Average < DRY_THRESHOLD_PCT and at least MIN_HOURS_BETWEEN_WATERING
+//     since the last watering -> queue. A later moist window cancels it.
+//   - MAX_DAYS_WITHOUT_WATER since the last watering -> queue, reading or not,
+//     retried every hour until one completes.
+//   - One attempt per hour. A failed attempt (stopped, reset) discards the
+//     queued signal and the current window; only new readings can queue again.
+//   - The last watering is saved to flash as UTC, so time powered off counts.
+//     Before the clock is set, a since-watering counter saved hourly is used.
+//   - The clock comes from TIME_API_URL (NTP_SERVER as fallback), joining
+//     Wi-Fi for a few seconds every CLOCK_RESYNC_H.
 //
 // Safety (no endless watering):
 //   - Relay off (reads WET) first thing on every boot; losing power closes
 //     the NC contact, which also reads WET.
 //   - Each session is hard-capped at 7 min (MAX_WATERING_SESSION_S), by loop()
 //     and by an independent timer that forces the relay off.
-//   - The counter resets when a session starts, so a reset mid-session can't
-//     restart it; the watchdog resets the board if loop() stalls.
+//   - The hour of each attempt is saved to flash before the relay turns on, so
+//     a reset mid-session can't repeat it; the watchdog resets the board if
+//     loop() stalls.
 //   - Fit a 10k pull-down from the relay module's IN to GND so the relay stays
 //     off in the fraction of a second before the firmware takes the pin.
 //
-// Logging: every line starts with [uptime d hh:mm:ss]. A HEARTBEAT line every
+// Logging: every line starts with [uptime d hh:mm:ss], plus UTC hh:mm:ssZ once
+// the clock is set. A HEARTBEAT line every
 // HEARTBEAT_S shows the relay state, schedule and radio counters, so a quiet
 // log still proves the board is alive. The LED blinks on each packet and stays
 // on while watering.
 //
 // Serial commands (115200 baud): s = status, w = water now, x = stop watering,
 // c = reset counter (as if just watered), f = jump counter to the fallback
-// limit, h = help.
+// limit, p = queue a watering for the next slot, t = sync clock now, r = relay
+// test, d = hold relay DRY until any key, h = help.
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -55,8 +67,17 @@
 #include <esp_task_wdt.h>
 #include <esp_system.h>
 #include <Preferences.h>
+#include <HTTPClient.h>
+#include <NetworkClientSecure.h>
+#include <esp_sntp.h>
+#include <time.h>
 #include <stdarg.h>
 #include "config.h"
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "Copy receiver/secrets.example.h to receiver/secrets.h and set the Wi-Fi name and password"
+#endif
 
 // XIAO ESP32-C6 RF switch: GPIO3 low enables it, GPIO14 picks the antenna.
 #define RF_SWITCH_ENABLE_PIN 3
@@ -75,6 +96,10 @@ static const uint32_t MAX_GAP_S = (uint32_t)MAX_DAYS_WITHOUT_WATER * 24UL * HOUR
 static const uint32_t WATER_S = (uint32_t)WATER_DURATION_MIN * 60UL;
 static const uint32_t SAVE_EVERY_S = HOUR_S;
 static const uint32_t NO_READING_WARN_S = (uint32_t)NO_READING_WARN_H * HOUR_S;
+static const int64_t SLOT_OFFSET_S = 3600 - WATER_LEAD_S;
+static_assert(WATER_LEAD_S > 0 && WATER_LEAD_S < WATER_DURATION_MIN * 60,
+              "the DRY hold must start before the hour and last past it");
+static_assert(WIFI_CONNECT_TIMEOUT_S < WATCHDOG_TIMEOUT_S, "Wi-Fi join would trip the watchdog");
 
 static Preferences prefs;
 
@@ -82,6 +107,22 @@ static Preferences prefs;
 static int64_t lastWaterAt = 0;
 static int64_t lastSaveAt = 0;
 static uint32_t wateringCount = 0;
+
+// UTC = uptimeS() + utcOffset, valid once clockSynced.
+static bool clockSynced = false;
+static int64_t utcOffset = 0;
+static bool syncAttempted = false;
+static bool lastSyncOk = false;
+static int64_t lastSyncAttemptAt = 0;
+static int64_t lastSyncOkAt = 0;
+static const char *clockSource = "";
+// Last watering (UTC) read from flash at boot, applied when the clock is set; 0 = none.
+static int64_t restoredLastWaterUtc = 0;
+
+enum PendingReason { PENDING_NONE, PENDING_DRY, PENDING_FORCED, PENDING_MANUAL };
+static PendingReason pending = PENDING_NONE;
+// UTC hour (utc / 3600) whose X:59:30 slot was last used; -1 = none.
+static int64_t lastAttemptHour = -1;
 
 static bool watering = false;
 static int64_t wateringStartedAt = 0;
@@ -117,10 +158,30 @@ static uint32_t packetsReceived = 0;
 static uint32_t packetsMissed = 0;
 static uint32_t packetsDuplicate = 0;
 
+// Readings collected toward the next watering decision.
+static int64_t windowStartedAt = 0;
+static uint32_t windowPackets = 0;
+static uint32_t windowSum[MAX_SENSORS];
+static uint32_t windowValid[MAX_SENSORS];
+static MoisturePacket windowLastPacket;
+
 // ---- Helpers ---------------------------------------------------------------
 
 static int64_t uptimeS() {
   return esp_timer_get_time() / 1000000LL;
+}
+
+static int64_t nowUtc() {
+  return uptimeS() + utcOffset;
+}
+
+static String fmtUtc(int64_t utc, bool withDate) {
+  time_t t = (time_t)utc;
+  struct tm tm;
+  gmtime_r(&t, &tm);
+  char buf[24];
+  strftime(buf, sizeof(buf), withDate ? "%Y-%m-%d %H:%M:%SZ" : "%H:%M:%SZ", &tm);
+  return String(buf);
 }
 
 static uint32_t sinceWaterS() {
@@ -132,7 +193,7 @@ static float asHours(uint32_t s) {
   return (float)s / (float)HOUR_S;
 }
 
-// Timestamped log line: [d hh:mm:ss] message
+// Timestamped log line: [d hh:mm:ss] or [d hh:mm:ss hh:mm:ssZ] message
 static void logMsg(const char *fmt, ...) {
   char msg[256];
   va_list args;
@@ -140,9 +201,10 @@ static void logMsg(const char *fmt, ...) {
   vsnprintf(msg, sizeof(msg), fmt, args);
   va_end(args);
   uint32_t t = (uint32_t)uptimeS();
-  Serial.printf("[%lud %02lu:%02lu:%02lu] %s\n", (unsigned long)(t / 86400),
+  Serial.printf("[%lud %02lu:%02lu:%02lu%s%s] %s\n", (unsigned long)(t / 86400),
                 (unsigned long)(t / 3600 % 24), (unsigned long)(t / 60 % 60),
-                (unsigned long)(t % 60), msg);
+                (unsigned long)(t % 60), clockSynced ? " " : "",
+                clockSynced ? fmtUtc(nowUtc(), false).c_str() : "", msg);
 }
 
 static String macToString(const uint8_t *mac) {
@@ -203,9 +265,17 @@ static void setRelayDry(bool dry) {
 
 // ---- Schedule --------------------------------------------------------------
 
-static void saveCounter(bool announce) {
+// lastWaterChanged: lastWaterAt was just set (watering, 'c', 'f'), so a UTC
+// time restored from flash at boot no longer applies.
+static void saveCounter(bool announce, bool lastWaterChanged) {
   uint32_t since = sinceWaterS();
   size_t written = prefs.putULong("since_s", since);
+  if (clockSynced) {
+    if (prefs.putLong64("water_utc", nowUtc() - since) == 0) written = 0;
+  } else if (lastWaterChanged) {
+    prefs.remove("water_utc");
+  }
+  if (lastWaterChanged) restoredLastWaterUtc = 0;
   lastSaveAt = uptimeS();
   if (written == 0) {
     logMsg("ERROR: saving counter to flash failed");
@@ -221,32 +291,29 @@ static void onCutoffTimer(void *) {
   cutoffFired = true;
 }
 
+static void discardWindow();
+
 static void startWatering(const char *reason) {
   if (watering) {
     logMsg("already watering; '%s' ignored", reason);
     return;
   }
-  logMsg("WATERING START (%s): %.1f h since last watering, running %lu min (hard cap %d min)",
+  logMsg("WATERING START (%s): %.1f h since last watering, relay DRY for %lu min (hard cap %d min)",
        reason, asHours(sinceWaterS()), (unsigned long)WATER_DURATION_MIN, MAX_WATERING_SESSION_S / 60);
 
-  // Count the session as done before the relay turns on, and mark it in flash.
-  // If the board resets mid-session (e.g. a brownout when the coil energizes),
-  // it reboots with the relay off and won't water again until the next
-  // allowed time, instead of restarting the session over and over.
   watering = true;
   wateringStartedAt = uptimeS();
   lastProgressAt = wateringStartedAt;
-  lastWaterAt = wateringStartedAt;
-  wateringCount++;
-  prefs.putULong("count", wateringCount);
   prefs.putBool("session", true);
-  saveCounter(false);
 
   cutoffFired = false;
   if (cutoffTimer) esp_timer_start_once(cutoffTimer, (uint64_t)MAX_WATERING_SESSION_S * 1000000ULL);
   setRelayDry(true);
 }
 
+// completed: the DRY hold ran its full length, so it counts as a watering.
+// Either way the queued signal and the current window are discarded, so only
+// fresh readings can queue the next one.
 static void stopWatering(bool completed) {
   if (!watering) {
     logMsg("not watering; nothing to stop");
@@ -256,16 +323,216 @@ static void stopWatering(bool completed) {
   setRelayDry(false);
   if (cutoffTimer) esp_timer_stop(cutoffTimer);
   prefs.putBool("session", false);
+  pending = PENDING_NONE;
+  discardWindow();
   uint32_t ran = (uint32_t)(uptimeS() - wateringStartedAt);
   if (completed) {
-    logMsg("WATERING DONE after %s (total waterings: %lu)",
+    lastWaterAt = uptimeS();
+    wateringCount++;
+    prefs.putULong("count", wateringCount);
+    saveCounter(false, true);
+    logMsg("WATERING DONE after %s; counted as watered (total waterings: %lu)",
          fmtDuration(ran).c_str(), (unsigned long)wateringCount);
   } else {
-    logMsg("WATERING STOPPED early after %s; still counts as today's watering", fmtDuration(ran).c_str());
+    logMsg("WATERING FAILED: stopped after %s; not counted, signal discarded, waiting for new readings",
+         fmtDuration(ran).c_str());
   }
   uint32_t since = sinceWaterS();
-  logMsg("next: dry reading can water in %.1f h; forced watering in %.1f h",
+  logMsg("next: dry reading can queue in %.1f h; forced watering queued in %.1f h",
        asHours(MIN_GAP_S - min(since, MIN_GAP_S)), asHours(MAX_GAP_S - min(since, MAX_GAP_S)));
+}
+
+// ---- Clock -----------------------------------------------------------------
+
+// Days since 1970-01-01 for a proleptic Gregorian date (Hinnant's days_from_civil).
+static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+// "2026-10-02T09:17:04.1048446Z" -> seconds since the epoch.
+static bool parseIsoUtc(const char *s, int64_t &utc) {
+  int y, mo, d, h, mi, sec;
+  if (sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &sec) != 6) return false;
+  if (y < 2024 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60) return false;
+  utc = daysFromCivil(y, mo, d) * 86400LL + h * 3600LL + mi * 60LL + sec;
+  return true;
+}
+
+static bool fetchTimeApi(int64_t &utc) {
+  NetworkClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(10);
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  if (!http.begin(client, TIME_API_URL)) {
+    logMsg("clock: timeapi request setup failed");
+    return false;
+  }
+  int code = http.GET();
+  esp_task_wdt_reset();
+  String body = code == HTTP_CODE_OK ? http.getString() : String();
+  http.end();
+  if (code != HTTP_CODE_OK) {
+    logMsg("clock: timeapi failed (HTTP %d %s)", code, code < 0 ? HTTPClient::errorToString(code).c_str() : "");
+    return false;
+  }
+  const char *key = "\"utc_time\":\"";
+  int at = body.indexOf(key);
+  if (at < 0 || !parseIsoUtc(body.c_str() + at + strlen(key), utc)) {
+    logMsg("clock: timeapi reply not understood: %.80s", body.c_str());
+    return false;
+  }
+  return true;
+}
+
+static bool fetchNtp(int64_t &utc) {
+  configTime(0, 0, NTP_SERVER);
+  bool ok = false;
+  for (int i = 0; i < 500 && !ok; i++) {
+    esp_task_wdt_reset();
+    delay(10);
+    ok = esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED;
+  }
+  if (ok) utc = (int64_t)time(nullptr);
+  esp_sntp_stop();
+  if (!ok) logMsg("clock: NTP (%s) gave no answer", NTP_SERVER);
+  return ok;
+}
+
+static void applyClock(int64_t utc, const char *source) {
+  bool first = !clockSynced;
+  int64_t drift = clockSynced ? utc - nowUtc() : 0;
+  utcOffset = utc - uptimeS();
+  clockSynced = true;
+  clockSource = source;
+  lastSyncOkAt = uptimeS();
+  if (first) logMsg("clock: set from %s: %s", source, fmtUtc(utc, true).c_str());
+  else logMsg("clock: resynced from %s (was %+lld s off)", source, (long long)drift);
+
+  if (restoredLastWaterUtc > 0) {
+    int64_t since = utc - restoredLastWaterUtc;
+    if (since >= 0) {
+      lastWaterAt = uptimeS() - since;
+      logMsg("flash: last watering was %s, %.1f h ago (includes time powered off)",
+           fmtUtc(restoredLastWaterUtc, true).c_str(), asHours((uint32_t)since));
+    } else {
+      logMsg("flash: saved last watering %s is in the future; keeping the counter",
+           fmtUtc(restoredLastWaterUtc, true).c_str());
+    }
+    restoredLastWaterUtc = 0;
+  }
+  saveCounter(false, false);
+}
+
+// Blocks for up to ~WIFI_CONNECT_TIMEOUT_S + 25 s, feeding the watchdog; ESP-NOW
+// packets sent meanwhile are lost.
+static void syncClock() {
+  syncAttempted = true;
+  lastSyncAttemptAt = uptimeS();
+  logMsg("clock: joining Wi-Fi \"%s\" to fetch the time", WIFI_SSID);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_S * 1000UL) {
+    esp_task_wdt_reset();
+    delay(50);
+  }
+
+  int64_t utc = 0;
+  const char *source = nullptr;
+  if (WiFi.status() == WL_CONNECTED) {
+    logMsg("clock: Wi-Fi up after %lu ms (channel %d, %d dBm)",
+         millis() - start, WiFi.channel(), WiFi.RSSI());
+    esp_task_wdt_reset();
+    if (fetchTimeApi(utc)) source = "timeapi.io";
+    else if (fetchNtp(utc)) source = "NTP";
+  } else {
+    logMsg("clock: could not join Wi-Fi within %d s (status %d)", WIFI_CONNECT_TIMEOUT_S, (int)WiFi.status());
+  }
+
+  WiFi.disconnect();
+  for (int i = 0; i < 50 && WiFi.status() == WL_CONNECTED; i++) delay(10);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  uint8_t primary = 0;
+  wifi_second_chan_t second;
+  esp_wifi_get_channel(&primary, &second);
+  if (primary != ESPNOW_CHANNEL) logMsg("WARNING: radio on channel %d after sync, wanted %d", primary, ESPNOW_CHANNEL);
+
+  lastSyncOk = source != nullptr;
+  if (lastSyncOk) applyClock(utc, source);
+  else logMsg("clock: sync failed; retrying in %d min%s", CLOCK_RETRY_MIN,
+              clockSynced ? " (keeping the current clock)" : "");
+}
+
+static bool nearSlot() {
+  return clockSynced && nowUtc() % 3600 >= SLOT_OFFSET_S - 120;
+}
+
+static void maybeSyncClock() {
+  if (watering || nearSlot()) return;
+  if (syncAttempted) {
+    int64_t wait = lastSyncOk ? (int64_t)CLOCK_RESYNC_H * 3600 : (int64_t)CLOCK_RETRY_MIN * 60;
+    if (uptimeS() - lastSyncAttemptAt < wait) return;
+  }
+  syncClock();
+}
+
+// ---- Hourly slot -----------------------------------------------------------
+
+static const char *pendingName(PendingReason r) {
+  switch (r) {
+    case PENDING_DRY: return "soil dry";
+    case PENDING_FORCED: return "fallback: max days without water";
+    case PENDING_MANUAL: return "manual";
+    default: return "none";
+  }
+}
+
+// UTC start of the next slot (X:59:30) that can still be used.
+static int64_t nextSlotUtc() {
+  int64_t utc = nowUtc();
+  int64_t slot = utc - utc % 3600 + SLOT_OFFSET_S;
+  if (utc / 3600 == lastAttemptHour) slot += 3600;
+  return slot;
+}
+
+static String slotDescription() {
+  if (!clockSynced) return "waiting for the clock";
+  int64_t slot = nextSlotUtc();
+  int64_t wait = slot - nowUtc();
+  return fmtUtc(slot, false) + (wait > 0 ? ", in " + fmtDuration((uint32_t)wait) : String(", now"));
+}
+
+static void setPending(PendingReason r) {
+  if (pending == r) return;
+  pending = r;
+  if (r != PENDING_NONE) logMsg("  -> QUEUED (%s) for the next slot: %s", pendingName(r), slotDescription().c_str());
+}
+
+static void runSlot() {
+  if (pending == PENDING_NONE || watering || !clockSynced) return;
+  int64_t utc = nowUtc();
+  if (utc % 3600 < SLOT_OFFSET_S || utc / 3600 == lastAttemptHour) return;
+
+  lastAttemptHour = utc / 3600;
+  prefs.putLong64("attempt_hr", lastAttemptHour);
+  PendingReason reason = pending;
+  pending = PENDING_NONE;
+  if (reason == PENDING_DRY && sinceWaterS() < MIN_GAP_S) {
+    logMsg("slot: queued dry signal dropped; watered %.1f h ago", asHours(sinceWaterS()));
+    return;
+  }
+  logMsg("slot: playing back the queued watering for the %s check",
+       fmtUtc(utc - utc % 3600 + 3600, false).c_str());
+  startWatering(pendingName(reason));
 }
 
 // ---- Radio -----------------------------------------------------------------
@@ -362,6 +629,36 @@ static String sensorsToString(const MoisturePacket &pkt, bool includeUnfitted) {
   return s;
 }
 
+static void addToWindow(const MoisturePacket &pkt) {
+  if (windowPackets == 0) {
+    windowStartedAt = uptimeS();
+    memset(windowSum, 0, sizeof(windowSum));
+    memset(windowValid, 0, sizeof(windowValid));
+  }
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    if (rawIsValid(pkt.raw[i])) {
+      windowSum[i] += pkt.raw[i];
+      windowValid[i]++;
+    }
+  }
+  windowLastPacket = pkt;
+  windowPackets++;
+}
+
+// Per-sensor mean of the window's valid readings. A sensor with none keeps
+// its last (invalid) raw value, so it still reads as FAULT.
+static MoisturePacket windowAverage() {
+  MoisturePacket avg = windowLastPacket;
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    if (windowValid[i]) avg.raw[i] = (uint16_t)((windowSum[i] + windowValid[i] / 2) / windowValid[i]);
+  }
+  return avg;
+}
+
+static void discardWindow() {
+  windowPackets = 0;
+}
+
 static void handlePacket(const MoisturePacket &pkt, int rssi) {
 #if BLINK_ON_PACKET
   if (!watering) {
@@ -405,6 +702,22 @@ static void handlePacket(const MoisturePacket &pkt, int rssi) {
        gap > 0 ? "  gap " : "", gap > 0 ? fmtDuration(gap).c_str() : "");
   if (rssi < -85) logMsg("  weak signal (%d dBm); packets may be lost at this range", rssi);
 
+  addToWindow(pkt);
+}
+
+static void closeWindow() {
+  MoisturePacket pkt = windowAverage();
+  int avg = averageMoisture(pkt);
+  uint32_t packets = windowPackets;
+  uint32_t span = (uint32_t)(uptimeS() - windowStartedAt);
+  discardWindow();
+
+  char avgStr[12];
+  if (avg >= 0) snprintf(avgStr, sizeof(avgStr), "%d%%", avg);
+  else snprintf(avgStr, sizeof(avgStr), "n/a");
+  logMsg("DECISION over %lu readings in %s: avg=%s%s", (unsigned long)packets,
+       fmtDuration(span).c_str(), avgStr, sensorsToString(pkt, false).c_str());
+
   if (watering) {
     logMsg("  -> already watering");
     return;
@@ -415,13 +728,21 @@ static void handlePacket(const MoisturePacket &pkt, int rssi) {
     logMsg("  -> no usable sensor, no decision (forced watering in %.1f h still applies)",
          asHours(MAX_GAP_S - min(since, MAX_GAP_S)));
   } else if (avg >= DRY_THRESHOLD_PCT) {
-    logMsg("  -> moist (%d%% >= %d%%), no watering", avg, DRY_THRESHOLD_PCT);
+    if (pending == PENDING_DRY) {
+      pending = PENDING_NONE;
+      logMsg("  -> moist (%d%% >= %d%%); queued dry signal cancelled", avg, DRY_THRESHOLD_PCT);
+    } else {
+      logMsg("  -> moist (%d%% >= %d%%), no watering", avg, DRY_THRESHOLD_PCT);
+    }
   } else if (since < MIN_GAP_S) {
     logMsg("  -> dry (%d%% < %d%%) but watered %.1f h ago; allowed again in %.1f h",
          avg, DRY_THRESHOLD_PCT, asHours(since), asHours(MIN_GAP_S - since));
+  } else if (pending != PENDING_NONE) {
+    logMsg("  -> dry (%d%% < %d%%); already queued (%s) for %s", avg, DRY_THRESHOLD_PCT,
+         pendingName(pending), slotDescription().c_str());
   } else {
     logMsg("  -> dry (%d%% < %d%%) and %.1f h since last watering", avg, DRY_THRESHOLD_PCT, asHours(since));
-    startWatering("soil dry");
+    setPending(PENDING_DRY);
   }
 }
 
@@ -436,11 +757,15 @@ static void heartbeat() {
   String reading = haveReading
     ? (lastAverage >= 0 ? String(lastAverage) + "%" : String("n/a")) + " " + fmtDuration((uint32_t)(uptimeS() - lastReadingAt)) + " ago"
     : "none since boot";
-  logMsg("HEARTBEAT relay=%s | since water %.1f h, dry-water %s, forced in %.1f h | last reading %s | rx %lu missed %lu dup %lu dropped %lu%s",
-       relay.c_str(), asHours(since), allowed.c_str(), asHours(MAX_GAP_S - min(since, MAX_GAP_S)),
+  String queued = pending == PENDING_NONE ? String("none") : String(pendingName(pending)) + " @ " + slotDescription();
+  logMsg("HEARTBEAT relay=%s | queued %s | since water %.1f h, dry-water %s, forced in %.1f h | last reading %s | rx %lu missed %lu dup %lu dropped %lu%s%s",
+       relay.c_str(), queued.c_str(), asHours(since), allowed.c_str(), asHours(MAX_GAP_S - min(since, MAX_GAP_S)),
        reading.c_str(), (unsigned long)packetsReceived, (unsigned long)packetsMissed,
        (unsigned long)packetsDuplicate, (unsigned long)(droppedWrongSize + droppedWrongSender),
-       radioOk ? "" : " | RADIO DOWN");
+       radioOk ? "" : " | RADIO DOWN", clockSynced ? "" : " | CLOCK NOT SET");
+  if (pending != PENDING_NONE && !clockSynced) {
+    logMsg("WARNING: a watering is queued but the clock isn't set, so it can't be played back on the hour");
+  }
 
   uint32_t silentFor = haveReading ? (uint32_t)(uptimeS() - lastReadingAt) : (uint32_t)uptimeS();
   if (silentFor >= NO_READING_WARN_S) {
@@ -464,7 +789,16 @@ static void printStatus() {
   Serial.printf("since last watering: %.1f h   (dry-watering allowed after %d h, forced at %d days = %lu h)\n",
                 asHours(since), MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER,
                 (unsigned long)MAX_DAYS_WITHOUT_WATER * 24UL);
-  Serial.printf("total waterings: %lu\n", (unsigned long)wateringCount);
+  if (clockSynced) {
+    Serial.printf("last watered: %s   total waterings: %lu\n",
+                  fmtUtc(nowUtc() - since, true).c_str(), (unsigned long)wateringCount);
+    Serial.printf("clock: %s (from %s, synced %s ago%s)\n", fmtUtc(nowUtc(), true).c_str(), clockSource,
+                  fmtDuration((uint32_t)(uptimeS() - lastSyncOkAt)).c_str(), lastSyncOk ? "" : ", last resync failed");
+  } else {
+    Serial.printf("total waterings: %lu\n", (unsigned long)wateringCount);
+    Serial.printf("clock: NOT SET (%s)\n", syncAttempted ? "last sync failed" : "not tried yet");
+  }
+  Serial.printf("queued: %s   next slot: %s\n", pendingName(pending), slotDescription().c_str());
   if (haveReading) {
     Serial.printf("last reading: avg=%d%%%s seq=%lu rssi=%d dBm, %s ago\n",
                   lastAverage, sensorsToString(lastPacket, true).c_str(), (unsigned long)lastSeq, lastRssi,
@@ -480,8 +814,11 @@ static void printStatus() {
 }
 
 static void printSettings() {
-  logMsg("settings: water %d min | dry below %d%% | min gap %d h | forced after %d days",
-       WATER_DURATION_MIN, DRY_THRESHOLD_PCT, MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER);
+  logMsg("settings: water %d min from X:%02d:%02d UTC | dry below %d%% (averaged over %d s) | min gap %d h | forced after %d days",
+       WATER_DURATION_MIN, (int)(SLOT_OFFSET_S / 60), (int)(SLOT_OFFSET_S % 60), DRY_THRESHOLD_PCT,
+       DECISION_WINDOW_S, MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER);
+  logMsg("settings: clock from %s (fallback %s) via Wi-Fi \"%s\", resync every %d h",
+       TIME_API_URL, NTP_SERVER, WIFI_SSID, CLOCK_RESYNC_H);
   int fitted = 0;
   for (int i = 0; i < MAX_SENSORS; i++) {
     if (!SENSORS[i].fitted) continue;
@@ -497,7 +834,8 @@ static void printSettings() {
 }
 
 static void printHelp() {
-  Serial.println("commands: s=status  w=water now  x=stop watering  c=reset counter  f=force fallback  r=relay test  h=help");
+  Serial.println("commands: s=status  w=water now  p=queue for next slot  x=stop watering  c=reset counter  "
+                 "f=force fallback  t=sync clock  r=relay test  d=hold dry  h=help");
 }
 
 // Bench test: toggle the relay every RELAY_TEST_S seconds so the fake-probe resistance can
@@ -525,22 +863,45 @@ static void relayTest() {
   logMsg("RELAY TEST done after %d cycles; relay off (controller reads WET)", cycles);
 }
 
+// Holds the relay DRY with no time cap until any key; the schedule pauses meanwhile.
+static void holdDry() {
+  if (watering) {
+    logMsg("hold dry refused: watering in progress (x to stop it first)");
+    return;
+  }
+  logMsg("HOLD DRY: relay held DRY with no time cap; send any key to release");
+  while (Serial.available()) Serial.read();
+  setRelayDry(true);
+  int64_t startedAt = uptimeS();
+  while (!Serial.available()) {
+    esp_task_wdt_reset();
+    delay(10);
+  }
+  while (Serial.available()) Serial.read();
+  setRelayDry(false);
+  logMsg("HOLD DRY released after %s; relay off (controller reads WET)",
+       fmtDuration((uint32_t)(uptimeS() - startedAt)).c_str());
+}
+
 static void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
     switch (c) {
       case 'r': relayTest(); break;
+      case 'd': holdDry(); break;
       case 's': printStatus(); break;
       case 'w': logMsg("command: water now"); startWatering("manual"); break;
+      case 'p': logMsg("command: queue a watering for the next slot"); setPending(PENDING_MANUAL); break;
+      case 't': logMsg("command: sync clock"); syncClock(); break;
       case 'x': logMsg("command: stop watering"); stopWatering(false); break;
       case 'c':
         lastWaterAt = uptimeS();
-        saveCounter(false);
+        saveCounter(false, true);
         logMsg("command: counter reset to 0 (as if just watered)");
         break;
       case 'f':
         lastWaterAt = uptimeS() - (int64_t)MAX_GAP_S;
-        saveCounter(false);
+        saveCounter(false, true);
         logMsg("command: counter set to the fallback limit; forced watering next");
         break;
       case 'h': case '?': printHelp(); break;
@@ -622,19 +983,22 @@ void setup() {
   } else {
     // First boot: allow a watering on the first dry reading.
     since = MIN_GAP_S;
-    logMsg("flash: no saved counter (first boot); starting at %.1f h so a dry reading can water",
+    logMsg("flash: no saved counter (first boot); starting at %.1f h so a dry reading can queue",
          asHours(since));
   }
+  restoredLastWaterUtc = prefs.getLong64("water_utc", 0);
+  if (restoredLastWaterUtc > 0) {
+    logMsg("flash: last watering was %s; applied once the clock is set", fmtUtc(restoredLastWaterUtc, true).c_str());
+  }
+  lastAttemptHour = prefs.getLong64("attempt_hr", -1);
   wateringCount = prefs.getULong("count", 0);
   logMsg("flash: %lu waterings so far", (unsigned long)wateringCount);
   if (prefs.getBool("session", false)) {
-    // The counter was already reset when that session started, so it won't
-    // simply restart now.
-    logMsg("WARNING: a watering session was cut short by a reset; it still counts, not repeating it");
+    logMsg("WARNING: a watering was cut short by a reset; not counted, not repeated this hour");
     prefs.putBool("session", false);
   }
   lastWaterAt = uptimeS() - (int64_t)since;
-  saveCounter(false);
+  saveCounter(false, false);
 
   esp_timer_create_args_t timerArgs = {};
   timerArgs.callback = onCutoffTimer;
@@ -678,6 +1042,8 @@ void loop() {
   }
   reportDroppedPackets();
 
+  if (windowPackets && uptimeS() - windowStartedAt >= DECISION_WINDOW_S) closeWindow();
+
   if (ledBlinkUntilMs && (long)(millis() - ledBlinkUntilMs) >= 0) {
     ledBlinkUntilMs = 0;
     setLed(watering);
@@ -688,7 +1054,7 @@ void loop() {
   if (watering) {
     if (cutoffFired) {
       logMsg("SAFETY CUTOFF: hardware timer ended the session at the %d min cap", MAX_WATERING_SESSION_S / 60);
-      stopWatering(false);
+      stopWatering(true);
     } else if (now - wateringStartedAt >= (int64_t)min(WATER_S, (uint32_t)MAX_WATERING_SESSION_S)) {
       stopWatering(true);
     } else if (now - lastProgressAt >= WATERING_PROGRESS_S) {
@@ -697,12 +1063,15 @@ void loop() {
     }
   }
 
-  if (!watering && sinceWaterS() >= MAX_GAP_S) {
-    startWatering("fallback: max days without water");
+  if (!watering && pending != PENDING_FORCED && sinceWaterS() >= MAX_GAP_S) {
+    logMsg("fallback: %d days without watering", MAX_DAYS_WITHOUT_WATER);
+    setPending(PENDING_FORCED);
   }
+  runSlot();
+  maybeSyncClock();
 
   if (now - lastSaveAt >= (int64_t)SAVE_EVERY_S) {
-    saveCounter(true);
+    saveCounter(true, false);
   }
 
   if (now - lastHeartbeatAt >= HEARTBEAT_S) {

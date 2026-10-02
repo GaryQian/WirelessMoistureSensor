@@ -22,7 +22,7 @@ static const uint8_t RECEIVER_MAC[6] = {0x10, 0xBD, 0xA3, 0xB1, 0x40, 0x1C};
 // ---- Reporting -------------------------------------------------------------
 
 // How often to repeat the reading while powered (lights on).
-#define SEND_INTERVAL_S 60
+#define SEND_INTERVAL_MS 1000
 
 // Delivery attempts per reading when no ACK comes back (unicast only).
 #define SEND_ATTEMPTS 3
@@ -30,14 +30,11 @@ static const uint8_t RECEIVER_MAC[6] = {0x10, 0xBD, 0xA3, 0xB1, 0x40, 0x1C};
 // Let the sensor's oscillator and the supply settle before the first read.
 #define SENSOR_WARMUP_MS 2000
 
-// Print the raw ADC value this often over USB serial (for calibration).
-// 0 disables.
-#define PRINT_INTERVAL_MS 1000
-
-// Power indicator: the on-board LED blinks once this often, for this long.
-// (After each send it also blinks twice quickly = delivered, 5 times = failed.)
-#define POWER_BLINK_INTERVAL_MS 3000
-#define POWER_BLINK_ON_MS 200
+// The on-board LED blinks after every send: once = delivered, SEND_FAIL_BLINKS
+// times = failed. The steady blinking doubles as the power indicator.
+#define SEND_BLINK_ON_MS 60
+#define SEND_BLINK_OFF_MS 120
+#define SEND_FAIL_BLINKS 3
 
 // ---- Sensor ----------------------------------------------------------------
 

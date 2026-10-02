@@ -7,8 +7,15 @@
 
 // ---- Schedule --------------------------------------------------------------
 
-// How long the relay signals "dry" so the controller waters (real minutes,
-// not affected by TIME_SCALE).
+// The controller looks at the probe once an hour, on the hour (X:00), so a
+// decision to water is queued and played back at the next hour: the relay
+// goes DRY WATER_LEAD_S before X:00 and stays DRY for WATER_DURATION_MIN.
+// A watering only counts once that hold has run to the end. The hour comes
+// from world time (UTC) over Wi-Fi, so the controller's clock must be on a
+// whole-hour time zone and roughly right.
+#define WATER_LEAD_S 30
+
+// How long the relay signals "dry" (real minutes, not affected by TIME_SCALE).
 #define WATER_DURATION_MIN 5
 
 // Water when the average moisture of the fitted sensors is below this.
@@ -19,7 +26,11 @@
 // check the daily readings after installing and adjust.
 #define DRY_THRESHOLD_PCT 30
 
-// Water regardless of moisture after this many days without watering.
+// Readings are averaged over this many real seconds (per sensor) before each
+// watering decision. The sender reports every second.
+#define DECISION_WINDOW_S 20
+
+// Queue a watering regardless of moisture after this many days without one.
 #define MAX_DAYS_WITHOUT_WATER 10
 
 // Never water more often than this (limits watering to once per day).
@@ -53,7 +64,7 @@
 #define WATCHDOG_TIMEOUT_S 30
 
 // Relay test (serial 'r'): seconds in each state, long enough for a meter to settle.
-#define RELAY_TEST_S 4
+#define RELAY_TEST_S 20
 
 // ---- Logging ---------------------------------------------------------------
 
@@ -70,6 +81,21 @@
 // Flash the LED briefly on every packet received (the LED stays on while
 // watering).
 #define BLINK_ON_PACKET 1
+
+// ---- Clock -----------------------------------------------------------------
+
+// Wi-Fi name and password live in secrets.h (copy secrets.example.h). The
+// receiver joins only for a few seconds per sync, then returns to
+// ESPNOW_CHANNEL; packets sent meanwhile are lost.
+#define TIME_API_URL "https://timeapi.io/api/v1/time/current/utc"
+#define NTP_SERVER "pool.ntp.org"  // used when TIME_API_URL fails
+
+// Resync this often once the clock is set; retry this often after a failure.
+#define CLOCK_RESYNC_H 6
+#define CLOCK_RETRY_MIN 5
+
+// Give up joining Wi-Fi after this long. Keep well under WATCHDOG_TIMEOUT_S.
+#define WIFI_CONNECT_TIMEOUT_S 15
 
 // ---- Radio -----------------------------------------------------------------
 

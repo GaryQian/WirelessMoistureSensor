@@ -4,7 +4,7 @@
 // Tools > USB CDC On Boot: Enabled (for serial output)
 //
 // Boots when the grow lights come on, reads the raw ADC on A0-A2, and sends
-// all three in one ESP-NOW packet to the receiver every SEND_INTERVAL_S until
+// all three in one ESP-NOW packet to the receiver every SEND_INTERVAL_MS until
 // power goes away. No calibration here: the receiver knows which pins have
 // sensors and converts raw to moisture, so the sender (hard to reach) never
 // needs reflashing for tuning. No sleep or battery logic: the lights are the
@@ -30,8 +30,9 @@ static uint32_t seq = 0;
 static bool isBroadcast = false;
 
 static unsigned long lastSendMs = 0;
-static unsigned long lastPrintMs = 0;
-static unsigned long lastPowerBlinkMs = 0;
+
+static int ledTogglesLeft = 0;
+static unsigned long ledNextToggleMs = 0;
 
 // The send-callback signature changed in ESP-IDF 5.5 (Arduino core 3.3).
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
@@ -64,6 +65,24 @@ static void printSensors(const MoisturePacket &pkt) {
   for (int i = 0; i < MAX_SENSORS; i++) Serial.printf(" A%d=%u", i, pkt.raw[i]);
 }
 
+static void setLed(bool on) {
+  digitalWrite(LED_BUILTIN, on ? LOW : HIGH);  // XIAO C6 LED is active-low
+}
+
+static void startBlinks(int count) {
+  ledTogglesLeft = count * 2 - 1;
+  ledNextToggleMs = millis() + SEND_BLINK_ON_MS;
+  setLed(true);
+}
+
+static void updateLed() {
+  if (ledTogglesLeft == 0 || (long)(millis() - ledNextToggleMs) < 0) return;
+  bool turnOn = ledTogglesLeft % 2 == 0;
+  setLed(turnOn);
+  ledTogglesLeft--;
+  ledNextToggleMs = millis() + (turnOn ? SEND_BLINK_ON_MS : SEND_BLINK_OFF_MS);
+}
+
 static void sendReading() {
   MoisturePacket pkt;
   readSensors(pkt);
@@ -92,16 +111,7 @@ static void sendReading() {
                 delivered ? (isBroadcast ? "broadcast" : "ACKed") : "NOT delivered",
                 attempt);
 
-  // Visible without serial, and distinct from the single power blink:
-  // 2 quick blinks = delivered, 5 quick blinks = failed.
-  int blinks = delivered ? 2 : 5;
-  for (int i = 0; i < blinks; i++) {
-    digitalWrite(LED_BUILTIN, LOW);  // XIAO C6 LED is active-low
-    delay(60);
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(120);
-  }
-  lastPowerBlinkMs = millis();
+  startBlinks(delivered ? 1 : SEND_FAIL_BLINKS);
 }
 
 void setup() {
@@ -122,7 +132,7 @@ void setup() {
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);  // off
+  setLed(false);
 
   Serial.println();
   Serial.println("=== Moisture sender ===");
@@ -130,8 +140,8 @@ void setup() {
   Serial.printf("Reset reason: %d (1=power on, 9=brownout)\n", (int)esp_reset_reason());
   Serial.printf("This board's MAC: %s  (put it in receiver/config.h SENDER_MAC)\n",
                 WiFi.macAddress().c_str());
-  Serial.printf("Channel %d, interval %ds, sending raw A0-A2 (receiver interprets)\n",
-                ESPNOW_CHANNEL, SEND_INTERVAL_S);
+  Serial.printf("Channel %d, interval %d ms, sending raw A0-A2 (receiver interprets)\n",
+                ESPNOW_CHANNEL, SEND_INTERVAL_MS);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed; restarting in 5 s");
@@ -158,37 +168,15 @@ void setup() {
   }
 
   delay(SENSOR_WARMUP_MS);
-  sendReading();
   lastSendMs = millis();
-  lastPrintMs = millis();
+  sendReading();
 }
 
 void loop() {
-  unsigned long now = millis();
-
-  if (now - lastSendMs >= (unsigned long)SEND_INTERVAL_S * 1000UL) {
-    lastSendMs = now;
+  if (millis() - lastSendMs >= SEND_INTERVAL_MS) {
+    lastSendMs = millis();
     sendReading();
   }
-
-  // Power indicator: one blink every POWER_BLINK_INTERVAL_MS.
-  if (millis() - lastPowerBlinkMs >= POWER_BLINK_INTERVAL_MS) {
-    lastPowerBlinkMs = millis();
-    digitalWrite(LED_BUILTIN, LOW);  // on (active-low)
-    delay(POWER_BLINK_ON_MS);
-    digitalWrite(LED_BUILTIN, HIGH);
-  }
-
-#if PRINT_INTERVAL_MS > 0
-  if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
-    lastPrintMs = now;
-    MoisturePacket pkt;
-    readSensors(pkt);
-    Serial.print(" ");
-    printSensors(pkt);
-    Serial.println();
-  }
-#endif
-
-  delay(10);
+  updateLed();
+  delay(1);
 }
