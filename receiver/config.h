@@ -24,7 +24,7 @@
 //   | just under saturated 86% | saturated 100%
 // Measured in rootless soil; real bed soil may read a little differently, so
 // check the daily readings after installing and adjust.
-#define DRY_THRESHOLD_PCT 30
+#define DRY_THRESHOLD_PCT 35
 
 // Readings are averaged over this many real seconds (per sensor) before each
 // watering decision. The sender reports every second.
@@ -129,7 +129,7 @@ static const SensorConfig SENSORS[MAX_SENSORS] = {
   //   air (out of soil)                        ~2690  ->   0% (clamped)
   //   bag-dry soil, fully inserted             ~2460  ->   0%   rawDry
   //   mostly dry, lightly dampened             ~2370  ->   7%
-  //   damp, good watering point, no roots      ~2080  ->  31%   -> threshold 30%
+  //   damp, good watering point, no roots      ~2080  ->  31%
   //   same soil 24 h later (2026-09-29)        ~2122  ->  27%   (~3.5 pts/day, no plants)
   //   just under saturated, fully inserted     ~1410  ->  86%
   //   saturated (water pooling)                ~1242  -> 100%   rawWet
