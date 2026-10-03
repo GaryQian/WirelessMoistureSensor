@@ -401,6 +401,7 @@ static bool fetchNtp(int64_t &utc) {
   }
   if (ok) utc = (int64_t)time(nullptr);
   esp_sntp_stop();
+  applyHistoryTz();
   if (!ok) logMsg("clock: NTP (%s) gave no answer", NTP_SERVER);
   return ok;
 }
@@ -538,21 +539,50 @@ static void runSlot() {
 // ---- History ---------------------------------------------------------------
 
 struct __attribute__((packed)) HistoryEntry {
-  uint32_t utc;
+  uint32_t savedUtc;
+  uint32_t measuredUtc;
   int8_t avg;
 };
-static_assert(HISTORY_INTERVAL_H > 0 && HISTORY_DAYS * 24 % HISTORY_INTERVAL_H == 0,
-              "HISTORY_DAYS must be a whole number of HISTORY_INTERVAL_H blocks");
-static const int HISTORY_MAX = HISTORY_DAYS * 24 / HISTORY_INTERVAL_H;
-static const int64_t HISTORY_INTERVAL_S = (int64_t)HISTORY_INTERVAL_H * 3600;
+static const int HISTORY_MAX = HISTORY_DAYS * 2;
 static const int64_t HISTORY_KEEP_S = (int64_t)HISTORY_DAYS * 86400;
 
 // Oldest first.
 static HistoryEntry history[HISTORY_MAX];
 static int historyCount = 0;
+// Half-day (midnight-noon, noon-midnight in HISTORY_TZ) last checked; -1 = not yet.
+static int64_t historyHalfDay = -1;
+// Latest window average and its UTC time; lastWindowAt 0 = none.
+static int lastWindowAvg = -1;
+static int64_t lastWindowAt = 0;
+
+// configTime() overwrites TZ, so this is reapplied after every NTP sync.
+static void applyHistoryTz() {
+  setenv("TZ", HISTORY_TZ, 1);
+  tzset();
+}
+
+static struct tm localTm(int64_t utc) {
+  time_t t = (time_t)utc;
+  struct tm tm;
+  localtime_r(&t, &tm);
+  return tm;
+}
+
+static String fmtLocal(int64_t utc) {
+  struct tm tm = localTm(utc);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M %Z", &tm);
+  return String(buf);
+}
+
+static int64_t halfDayOf(int64_t utc) {
+  struct tm tm = localTm(utc);
+  return ((int64_t)tm.tm_year * 366 + tm.tm_yday) * 2 + (tm.tm_hour >= 12 ? 1 : 0);
+}
 
 static void loadHistory() {
-  size_t len = prefs.isKey("history") ? prefs.getBytesLength("history") : 0;
+  prefs.remove("history");
+  size_t len = prefs.isKey("history2") ? prefs.getBytesLength("history2") : 0;
   if (len == 0) return;
   if (len % sizeof(HistoryEntry) != 0) {
     logMsg("WARNING: saved moisture history is corrupt (%u bytes); starting a new one", (unsigned)len);
@@ -560,7 +590,7 @@ static void loadHistory() {
   }
   HistoryEntry *saved = (HistoryEntry *)malloc(len);
   if (!saved) return;
-  prefs.getBytes("history", saved, len);
+  prefs.getBytes("history2", saved, len);
   int n = len / sizeof(HistoryEntry);
   int skip = n > HISTORY_MAX ? n - HISTORY_MAX : 0;
   historyCount = n - skip;
@@ -569,32 +599,43 @@ static void loadHistory() {
   logMsg("flash: %d moisture history entries restored", historyCount);
 }
 
-static void recordHistory(int avg) {
-  if (!clockSynced || avg < 0) return;
-  int64_t utc = nowUtc();
-  if (historyCount > 0 && history[historyCount - 1].utc / HISTORY_INTERVAL_S == utc / HISTORY_INTERVAL_S) return;
-
+static void saveHistory(int64_t utc) {
   int drop = 0;
-  while (drop < historyCount && (int64_t)history[drop].utc < utc - HISTORY_KEEP_S) drop++;
+  while (drop < historyCount && (int64_t)history[drop].savedUtc < utc - HISTORY_KEEP_S) drop++;
   if (historyCount - drop >= HISTORY_MAX) drop = historyCount - HISTORY_MAX + 1;
   memmove(history, history + drop, (historyCount - drop) * sizeof(HistoryEntry));
   historyCount -= drop;
-  history[historyCount++] = {(uint32_t)utc, (int8_t)avg};
+  history[historyCount++] = {(uint32_t)utc, (uint32_t)lastWindowAt, (int8_t)lastWindowAvg};
 
-  if (prefs.putBytes("history", history, historyCount * sizeof(HistoryEntry)) == 0) {
+  if (prefs.putBytes("history2", history, historyCount * sizeof(HistoryEntry)) == 0) {
     logMsg("ERROR: saving moisture history to flash failed");
   } else {
-    logMsg("history: saved %d%% for this %d h block (%d of %d entries)", avg, HISTORY_INTERVAL_H,
-         historyCount, HISTORY_MAX);
+    logMsg("history: saved %d%% measured %s (%d of %d entries)", lastWindowAvg,
+         fmtLocal(lastWindowAt).c_str(), historyCount, HISTORY_MAX);
   }
 }
 
+static void historyTick() {
+  if (!clockSynced) return;
+  int64_t utc = nowUtc();
+  int64_t half = halfDayOf(utc);
+  if (half == historyHalfDay) return;
+  bool first = historyHalfDay < 0;
+  historyHalfDay = half;
+  if (first) return;
+
+  int64_t lastSaved = historyCount ? (int64_t)history[historyCount - 1].measuredUtc : 0;
+  if (lastWindowAt > lastSaved) saveHistory(utc);
+  else logMsg("history: no new reading since the last save; nothing saved");
+}
+
 static void printHistory() {
-  Serial.printf("--- moisture history: first average in each %d h UTC block, last %d days ---\n",
-                HISTORY_INTERVAL_H, HISTORY_DAYS);
+  Serial.printf("--- moisture history: saved at midnight and noon (%s), last %d days ---\n",
+                HISTORY_TZ, HISTORY_DAYS);
   if (historyCount == 0) Serial.println("(none yet)");
   for (int i = 0; i < historyCount; i++) {
-    Serial.printf("%s  %3d%%\n", fmtUtc(history[i].utc, true).c_str(), history[i].avg);
+    Serial.printf("%s  %3d%%  (measured %s)\n", fmtLocal(history[i].savedUtc).c_str(), history[i].avg,
+                  fmtLocal(history[i].measuredUtc).c_str());
   }
   Serial.println("--------------");
 }
@@ -781,7 +822,10 @@ static void closeWindow() {
   else snprintf(avgStr, sizeof(avgStr), "n/a");
   logMsg("DECISION over %lu readings in %s: avg=%s%s", (unsigned long)packets,
        fmtDuration(span).c_str(), avgStr, sensorsToString(pkt, false).c_str());
-  recordHistory(avg);
+  if (avg >= 0 && clockSynced) {
+    lastWindowAvg = avg;
+    lastWindowAt = nowUtc();
+  }
 
   if (watering) {
     logMsg("  -> already watering");
@@ -885,8 +929,8 @@ static void printSettings() {
        DECISION_WINDOW_S, MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER);
   logMsg("settings: clock from %s (fallback %s) via Wi-Fi \"%s\", resync every %d h",
        TIME_API_URL, NTP_SERVER, WIFI_SSID, CLOCK_RESYNC_H);
-  logMsg("settings: moisture history every %d h UTC, kept %d days (%d entries)",
-       HISTORY_INTERVAL_H, HISTORY_DAYS, HISTORY_MAX);
+  logMsg("settings: moisture history at midnight and noon (%s), kept %d days (%d entries)",
+       HISTORY_TZ, HISTORY_DAYS, HISTORY_MAX);
   int fitted = 0;
   for (int i = 0; i < MAX_SENSORS; i++) {
     if (!SENSORS[i].fitted) continue;
@@ -1060,6 +1104,7 @@ void setup() {
     logMsg("flash: last watering was %s; applied once the clock is set", fmtUtc(restoredLastWaterUtc, true).c_str());
   }
   lastAttemptHour = prefs.getLong64("attempt_hr", -1);
+  applyHistoryTz();
   loadHistory();
   wateringCount = prefs.getULong("count", 0);
   logMsg("flash: %lu waterings so far", (unsigned long)wateringCount);
@@ -1138,6 +1183,7 @@ void loop() {
     setPending(PENDING_FORCED);
   }
   runSlot();
+  historyTick();
   maybeSyncClock();
 
   if (now - lastSaveAt >= (int64_t)SAVE_EVERY_S) {
