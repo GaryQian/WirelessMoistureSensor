@@ -57,8 +57,8 @@
 //
 // Serial commands (115200 baud): s = status, w = water now, x = stop watering,
 // c = reset counter (as if just watered), f = jump counter to the fallback
-// limit, p = queue a watering for the next slot, t = sync clock now, r = relay
-// test, d = hold relay DRY until any key, h = help.
+// limit, p = queue a watering for the next slot, t = sync clock now, l = list
+// moisture history, r = relay test, d = hold relay DRY until any key, h = help.
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -535,6 +535,70 @@ static void runSlot() {
   startWatering(pendingName(reason));
 }
 
+// ---- History ---------------------------------------------------------------
+
+struct __attribute__((packed)) HistoryEntry {
+  uint32_t utc;
+  int8_t avg;
+};
+static_assert(HISTORY_INTERVAL_H > 0 && HISTORY_DAYS * 24 % HISTORY_INTERVAL_H == 0,
+              "HISTORY_DAYS must be a whole number of HISTORY_INTERVAL_H blocks");
+static const int HISTORY_MAX = HISTORY_DAYS * 24 / HISTORY_INTERVAL_H;
+static const int64_t HISTORY_INTERVAL_S = (int64_t)HISTORY_INTERVAL_H * 3600;
+static const int64_t HISTORY_KEEP_S = (int64_t)HISTORY_DAYS * 86400;
+
+// Oldest first.
+static HistoryEntry history[HISTORY_MAX];
+static int historyCount = 0;
+
+static void loadHistory() {
+  size_t len = prefs.isKey("history") ? prefs.getBytesLength("history") : 0;
+  if (len == 0) return;
+  if (len % sizeof(HistoryEntry) != 0) {
+    logMsg("WARNING: saved moisture history is corrupt (%u bytes); starting a new one", (unsigned)len);
+    return;
+  }
+  HistoryEntry *saved = (HistoryEntry *)malloc(len);
+  if (!saved) return;
+  prefs.getBytes("history", saved, len);
+  int n = len / sizeof(HistoryEntry);
+  int skip = n > HISTORY_MAX ? n - HISTORY_MAX : 0;
+  historyCount = n - skip;
+  memcpy(history, saved + skip, historyCount * sizeof(HistoryEntry));
+  free(saved);
+  logMsg("flash: %d moisture history entries restored", historyCount);
+}
+
+static void recordHistory(int avg) {
+  if (!clockSynced || avg < 0) return;
+  int64_t utc = nowUtc();
+  if (historyCount > 0 && history[historyCount - 1].utc / HISTORY_INTERVAL_S == utc / HISTORY_INTERVAL_S) return;
+
+  int drop = 0;
+  while (drop < historyCount && (int64_t)history[drop].utc < utc - HISTORY_KEEP_S) drop++;
+  if (historyCount - drop >= HISTORY_MAX) drop = historyCount - HISTORY_MAX + 1;
+  memmove(history, history + drop, (historyCount - drop) * sizeof(HistoryEntry));
+  historyCount -= drop;
+  history[historyCount++] = {(uint32_t)utc, (int8_t)avg};
+
+  if (prefs.putBytes("history", history, historyCount * sizeof(HistoryEntry)) == 0) {
+    logMsg("ERROR: saving moisture history to flash failed");
+  } else {
+    logMsg("history: saved %d%% for this %d h block (%d of %d entries)", avg, HISTORY_INTERVAL_H,
+         historyCount, HISTORY_MAX);
+  }
+}
+
+static void printHistory() {
+  Serial.printf("--- moisture history: first average in each %d h UTC block, last %d days ---\n",
+                HISTORY_INTERVAL_H, HISTORY_DAYS);
+  if (historyCount == 0) Serial.println("(none yet)");
+  for (int i = 0; i < historyCount; i++) {
+    Serial.printf("%s  %3d%%\n", fmtUtc(history[i].utc, true).c_str(), history[i].avg);
+  }
+  Serial.println("--------------");
+}
+
 // ---- Radio -----------------------------------------------------------------
 
 static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -717,6 +781,7 @@ static void closeWindow() {
   else snprintf(avgStr, sizeof(avgStr), "n/a");
   logMsg("DECISION over %lu readings in %s: avg=%s%s", (unsigned long)packets,
        fmtDuration(span).c_str(), avgStr, sensorsToString(pkt, false).c_str());
+  recordHistory(avg);
 
   if (watering) {
     logMsg("  -> already watering");
@@ -799,6 +864,7 @@ static void printStatus() {
     Serial.printf("clock: NOT SET (%s)\n", syncAttempted ? "last sync failed" : "not tried yet");
   }
   Serial.printf("queued: %s   next slot: %s\n", pendingName(pending), slotDescription().c_str());
+  Serial.printf("history: %d of %d entries saved (l to list)\n", historyCount, HISTORY_MAX);
   if (haveReading) {
     Serial.printf("last reading: avg=%d%%%s seq=%lu rssi=%d dBm, %s ago\n",
                   lastAverage, sensorsToString(lastPacket, true).c_str(), (unsigned long)lastSeq, lastRssi,
@@ -819,6 +885,8 @@ static void printSettings() {
        DECISION_WINDOW_S, MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER);
   logMsg("settings: clock from %s (fallback %s) via Wi-Fi \"%s\", resync every %d h",
        TIME_API_URL, NTP_SERVER, WIFI_SSID, CLOCK_RESYNC_H);
+  logMsg("settings: moisture history every %d h UTC, kept %d days (%d entries)",
+       HISTORY_INTERVAL_H, HISTORY_DAYS, HISTORY_MAX);
   int fitted = 0;
   for (int i = 0; i < MAX_SENSORS; i++) {
     if (!SENSORS[i].fitted) continue;
@@ -835,7 +903,7 @@ static void printSettings() {
 
 static void printHelp() {
   Serial.println("commands: s=status  w=water now  p=queue for next slot  x=stop watering  c=reset counter  "
-                 "f=force fallback  t=sync clock  r=relay test  d=hold dry  h=help");
+                 "f=force fallback  t=sync clock  l=history  r=relay test  d=hold dry  h=help");
 }
 
 // Bench test: toggle the relay every RELAY_TEST_S seconds so the fake-probe resistance can
@@ -904,6 +972,7 @@ static void handleSerial() {
         saveCounter(false, true);
         logMsg("command: counter set to the fallback limit; forced watering next");
         break;
+      case 'l': printHistory(); break;
       case 'h': case '?': printHelp(); break;
       default: break;
     }
@@ -991,6 +1060,7 @@ void setup() {
     logMsg("flash: last watering was %s; applied once the clock is set", fmtUtc(restoredLastWaterUtc, true).c_str());
   }
   lastAttemptHour = prefs.getLong64("attempt_hr", -1);
+  loadHistory();
   wateringCount = prefs.getULong("count", 0);
   logMsg("flash: %lu waterings so far", (unsigned long)wateringCount);
   if (prefs.getBool("session", false)) {

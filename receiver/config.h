@@ -78,6 +78,13 @@
 // scaled by TIME_SCALE). Lights come on daily, so a gap over a day is suspect.
 #define NO_READING_WARN_H 26
 
+// Moisture history (serial 'l'): the first average of the fitted sensors in
+// each HISTORY_INTERVAL_H block of UTC (00:00Z, 12:00Z) is saved to flash.
+// Blocks with no readings (lights off) have no entry. Entries older than
+// HISTORY_DAYS are dropped.
+#define HISTORY_INTERVAL_H 12
+#define HISTORY_DAYS 14
+
 // Flash the LED briefly on every packet received (the LED stays on while
 // watering).
 #define BLINK_ON_PACKET 1
