@@ -24,7 +24,7 @@
 //   | just under saturated 86% | saturated 100%
 // Measured in rootless soil; real bed soil may read a little differently, so
 // check the daily readings after installing and adjust.
-#define DRY_THRESHOLD_PCT 35
+#define DRY_THRESHOLD_PCT 40
 
 // Readings are averaged over this many real seconds (per sensor) before each
 // watering decision. The sender reports every second.
