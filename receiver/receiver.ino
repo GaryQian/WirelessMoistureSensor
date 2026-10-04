@@ -35,8 +35,17 @@
 //     queued signal and the current window; only new readings can queue again.
 //   - The last watering is saved to flash as UTC, so time powered off counts.
 //     Before the clock is set, a since-watering counter saved hourly is used.
-//   - The clock comes from TIME_API_URL (NTP_SERVER as fallback), joining
-//     Wi-Fi for a few seconds every CLOCK_RESYNC_H.
+//   - The clock comes from TIME_API_URL (NTP_SERVER as fallback) every
+//     CLOCK_RESYNC_H.
+//
+// Network: the sender is fixed on ESPNOW_CHANNEL and the radio can only be on
+// one channel, so the receiver stays on Wi-Fi only while the router is on that
+// channel. Then it serves a read-only web page with a chart on WEB_PORT, with
+// JSON at /api/current and /api/history (also http://MDNS_NAME.local/ at home),
+// and accepts OTA uploads if OTA_PASSWORD is in secrets.h. The server runs in
+// its own task on a copy of the state, so web clients can't stall the watering
+// logic. If the router is on another channel, the receiver stays off Wi-Fi
+// (web page down) and syncs the clock by joining for a few seconds at a time.
 //
 // Safety (no endless watering):
 //   - Relay off (reads WET) first thing on every boot; losing power closes
@@ -70,9 +79,12 @@
 #include <HTTPClient.h>
 #include <NetworkClientSecure.h>
 #include <esp_sntp.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include <stdarg.h>
 #include "config.h"
+#include "web.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -99,7 +111,6 @@ static const uint32_t NO_READING_WARN_S = (uint32_t)NO_READING_WARN_H * HOUR_S;
 static const int64_t SLOT_OFFSET_S = 3600 - WATER_LEAD_S;
 static_assert(WATER_LEAD_S > 0 && WATER_LEAD_S < WATER_DURATION_MIN * 60,
               "the DRY hold must start before the hour and last past it");
-static_assert(WIFI_CONNECT_TIMEOUT_S < WATCHDOG_TIMEOUT_S, "Wi-Fi join would trip the watchdog");
 
 static Preferences prefs;
 
@@ -119,12 +130,12 @@ static const char *clockSource = "";
 // Last watering (UTC) read from flash at boot, applied when the clock is set; 0 = none.
 static int64_t restoredLastWaterUtc = 0;
 
-enum PendingReason { PENDING_NONE, PENDING_DRY, PENDING_FORCED, PENDING_MANUAL };
 static PendingReason pending = PENDING_NONE;
 // UTC hour (utc / 3600) whose X:59:30 slot was last used; -1 = none.
 static int64_t lastAttemptHour = -1;
 
 static bool watering = false;
+static PendingReason wateringReason = PENDING_NONE;
 static int64_t wateringStartedAt = 0;
 static esp_timer_handle_t cutoffTimer = nullptr;
 static volatile bool cutoffFired = false;
@@ -146,6 +157,12 @@ static uint32_t reportedWrongSize = 0, reportedWrongSender = 0;
 
 static bool radioOk = false;
 static bool filterSender = false;
+static bool wifiUp = false;
+static bool wifiJoining = false;
+static int64_t wifiJoinStartedAt = 0;
+static int64_t lastWifiCheckAt = -(int64_t)WIFI_RETRY_S;
+static bool routerOnEspNowChannel = true;
+static bool networkServicesStarted = false;
 
 // Last reading, for status.
 static bool haveReading = false;
@@ -164,6 +181,12 @@ static uint32_t windowPackets = 0;
 static uint32_t windowSum[MAX_SENSORS];
 static uint32_t windowValid[MAX_SENSORS];
 static MoisturePacket windowLastPacket;
+
+// Last closed window, for the web page.
+static bool haveWindow = false;
+static MoisturePacket lastWindowPacket;
+static int lastWindowAvgAny = -1;
+static int64_t lastWindowClosedAt = 0;
 
 // ---- Helpers ---------------------------------------------------------------
 
@@ -292,16 +315,18 @@ static void onCutoffTimer(void *) {
 }
 
 static void discardWindow();
+static void recordWateringEvent(bool completed);
 
-static void startWatering(const char *reason) {
+static void startWatering(PendingReason reason) {
   if (watering) {
-    logMsg("already watering; '%s' ignored", reason);
+    logMsg("already watering; '%s' ignored", pendingName(reason));
     return;
   }
   logMsg("WATERING START (%s): %.1f h since last watering, relay DRY for %lu min (hard cap %d min)",
-       reason, asHours(sinceWaterS()), (unsigned long)WATER_DURATION_MIN, MAX_WATERING_SESSION_S / 60);
+       pendingName(reason), asHours(sinceWaterS()), (unsigned long)WATER_DURATION_MIN, MAX_WATERING_SESSION_S / 60);
 
   watering = true;
+  wateringReason = reason;
   wateringStartedAt = uptimeS();
   lastProgressAt = wateringStartedAt;
   prefs.putBool("session", true);
@@ -325,6 +350,7 @@ static void stopWatering(bool completed) {
   prefs.putBool("session", false);
   pending = PENDING_NONE;
   discardWindow();
+  recordWateringEvent(completed);
   uint32_t ran = (uint32_t)(uptimeS() - wateringStartedAt);
   if (completed) {
     lastWaterAt = uptimeS();
@@ -431,41 +457,48 @@ static void applyClock(int64_t utc, const char *source) {
   saveCounter(false, false);
 }
 
-// Blocks for up to ~WIFI_CONNECT_TIMEOUT_S + 25 s, feeding the watchdog; ESP-NOW
-// packets sent meanwhile are lost.
-static void syncClock() {
-  syncAttempted = true;
-  lastSyncAttemptAt = uptimeS();
-  logMsg("clock: joining Wi-Fi \"%s\" to fetch the time", WIFI_SSID);
-  WiFi.persistent(false);
-  WiFi.setAutoReconnect(false);
+static void restoreEspNowChannel() {
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+}
+
+// Joins Wi-Fi on whatever channel the router uses, fetches the time, leaves,
+// and returns to ESPNOW_CHANNEL. Packets sent meanwhile are lost.
+static const char *fetchTimeViaBriefJoin(int64_t &utc) {
+  logMsg("clock: joining Wi-Fi \"%s\" briefly to fetch the time", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_S * 1000UL) {
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_JOIN_TIMEOUT_S * 1000UL) {
     esp_task_wdt_reset();
     delay(50);
   }
-
-  int64_t utc = 0;
   const char *source = nullptr;
   if (WiFi.status() == WL_CONNECTED) {
-    logMsg("clock: Wi-Fi up after %lu ms (channel %d, %d dBm)",
-         millis() - start, WiFi.channel(), WiFi.RSSI());
+    logMsg("clock: Wi-Fi up after %lu ms (channel %d, %d dBm)", millis() - start, WiFi.channel(), WiFi.RSSI());
     esp_task_wdt_reset();
     if (fetchTimeApi(utc)) source = "timeapi.io";
     else if (fetchNtp(utc)) source = "NTP";
   } else {
-    logMsg("clock: could not join Wi-Fi within %d s (status %d)", WIFI_CONNECT_TIMEOUT_S, (int)WiFi.status());
+    logMsg("clock: could not join Wi-Fi within %d s (status %d)", WIFI_JOIN_TIMEOUT_S, (int)WiFi.status());
   }
-
   WiFi.disconnect();
   for (int i = 0; i < 50 && WiFi.status() == WL_CONNECTED; i++) delay(10);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  uint8_t primary = 0;
-  wifi_second_chan_t second;
-  esp_wifi_get_channel(&primary, &second);
-  if (primary != ESPNOW_CHANNEL) logMsg("WARNING: radio on channel %d after sync, wanted %d", primary, ESPNOW_CHANNEL);
+  restoreEspNowChannel();
+  return source;
+}
+
+// Blocks for up to ~40 s, feeding the watchdog.
+static void syncClock() {
+  syncAttempted = true;
+  lastSyncAttemptAt = uptimeS();
+  int64_t utc = 0;
+  const char *source = nullptr;
+  if (wifiUp) {
+    if (fetchTimeApi(utc)) source = "timeapi.io";
+    else if (fetchNtp(utc)) source = "NTP";
+  } else {
+    source = fetchTimeViaBriefJoin(utc);
+  }
 
   lastSyncOk = source != nullptr;
   if (lastSyncOk) applyClock(utc, source);
@@ -478,7 +511,7 @@ static bool nearSlot() {
 }
 
 static void maybeSyncClock() {
-  if (watering || nearSlot()) return;
+  if (wifiJoining || watering || nearSlot()) return;
   if (syncAttempted) {
     int64_t wait = lastSyncOk ? (int64_t)CLOCK_RESYNC_H * 3600 : (int64_t)CLOCK_RETRY_MIN * 60;
     if (uptimeS() - lastSyncAttemptAt < wait) return;
@@ -487,15 +520,6 @@ static void maybeSyncClock() {
 }
 
 // ---- Hourly slot -----------------------------------------------------------
-
-static const char *pendingName(PendingReason r) {
-  switch (r) {
-    case PENDING_DRY: return "soil dry";
-    case PENDING_FORCED: return "fallback: max days without water";
-    case PENDING_MANUAL: return "manual";
-    default: return "none";
-  }
-}
 
 // UTC start of the next slot (X:59:30) that can still be used.
 static int64_t nextSlotUtc() {
@@ -533,17 +557,52 @@ static void runSlot() {
   }
   logMsg("slot: playing back the queued watering for the %s check",
        fmtUtc(utc - utc % 3600 + 3600, false).c_str());
-  startWatering(pendingName(reason));
+  startWatering(reason);
+}
+
+// ---- Flash records ---------------------------------------------------------
+
+// Arrays of fixed-size records, oldest first, each starting with a uint32_t
+// UTC time, saved whole under one Preferences key.
+
+static int loadRecords(const char *key, void *out, size_t size, int max) {
+  size_t len = prefs.isKey(key) ? prefs.getBytesLength(key) : 0;
+  if (len == 0) return 0;
+  if (len % size != 0) {
+    logMsg("WARNING: saved %s is corrupt (%u bytes); starting over", key, (unsigned)len);
+    return 0;
+  }
+  uint8_t *saved = (uint8_t *)malloc(len);
+  if (!saved) return 0;
+  prefs.getBytes(key, saved, len);
+  int n = len / size;
+  int skip = n > max ? n - max : 0;
+  memcpy(out, saved + skip * size, (n - skip) * size);
+  free(saved);
+  return n - skip;
+}
+
+// Drops records older than keepAfter, then the oldest beyond max - 1, and appends rec.
+static void appendRecord(void *buf, int &count, size_t size, int max, const void *rec, int64_t keepAfter) {
+  uint8_t *b = (uint8_t *)buf;
+  int drop = 0;
+  uint32_t utc;
+  while (drop < count && (memcpy(&utc, b + drop * size, 4), (int64_t)utc < keepAfter)) drop++;
+  if (count - drop >= max) drop = count - max + 1;
+  memmove(b, b + drop * size, (count - drop) * size);
+  count -= drop;
+  memcpy(b + count * size, rec, size);
+  count++;
+}
+
+static bool saveRecords(const char *key, const void *buf, int count, size_t size) {
+  if (prefs.putBytes(key, buf, count * size) != 0) return true;
+  logMsg("ERROR: saving %s to flash failed", key);
+  return false;
 }
 
 // ---- History ---------------------------------------------------------------
 
-struct __attribute__((packed)) HistoryEntry {
-  uint32_t savedUtc;
-  uint32_t measuredUtc;
-  int8_t avg;
-};
-static const int HISTORY_MAX = HISTORY_DAYS * 2;
 static const int64_t HISTORY_KEEP_S = (int64_t)HISTORY_DAYS * 86400;
 
 // Oldest first.
@@ -582,34 +641,14 @@ static int64_t halfDayOf(int64_t utc) {
 
 static void loadHistory() {
   prefs.remove("history");
-  size_t len = prefs.isKey("history2") ? prefs.getBytesLength("history2") : 0;
-  if (len == 0) return;
-  if (len % sizeof(HistoryEntry) != 0) {
-    logMsg("WARNING: saved moisture history is corrupt (%u bytes); starting a new one", (unsigned)len);
-    return;
-  }
-  HistoryEntry *saved = (HistoryEntry *)malloc(len);
-  if (!saved) return;
-  prefs.getBytes("history2", saved, len);
-  int n = len / sizeof(HistoryEntry);
-  int skip = n > HISTORY_MAX ? n - HISTORY_MAX : 0;
-  historyCount = n - skip;
-  memcpy(history, saved + skip, historyCount * sizeof(HistoryEntry));
-  free(saved);
-  logMsg("flash: %d moisture history entries restored", historyCount);
+  historyCount = loadRecords("history2", history, sizeof(HistoryEntry), HISTORY_MAX);
+  if (historyCount) logMsg("flash: %d moisture history entries restored", historyCount);
 }
 
 static void saveHistory(int64_t utc) {
-  int drop = 0;
-  while (drop < historyCount && (int64_t)history[drop].savedUtc < utc - HISTORY_KEEP_S) drop++;
-  if (historyCount - drop >= HISTORY_MAX) drop = historyCount - HISTORY_MAX + 1;
-  memmove(history, history + drop, (historyCount - drop) * sizeof(HistoryEntry));
-  historyCount -= drop;
-  history[historyCount++] = {(uint32_t)utc, (uint32_t)lastWindowAt, (int8_t)lastWindowAvg};
-
-  if (prefs.putBytes("history2", history, historyCount * sizeof(HistoryEntry)) == 0) {
-    logMsg("ERROR: saving moisture history to flash failed");
-  } else {
+  HistoryEntry e = {(uint32_t)utc, (uint32_t)lastWindowAt, (int8_t)lastWindowAvg};
+  appendRecord(history, historyCount, sizeof(HistoryEntry), HISTORY_MAX, &e, utc - HISTORY_KEEP_S);
+  if (saveRecords("history2", history, historyCount, sizeof(HistoryEntry))) {
     logMsg("history: saved %d%% measured %s (%d of %d entries)", lastWindowAvg,
          fmtLocal(lastWindowAt).c_str(), historyCount, HISTORY_MAX);
   }
@@ -638,6 +677,51 @@ static void printHistory() {
                   fmtLocal(history[i].measuredUtc).c_str());
   }
   Serial.println("--------------");
+}
+
+// ---- Hourly averages and watering events -----------------------------------
+
+static const int64_t HOURLY_KEEP_S = (int64_t)HOURLY_DAYS * 86400;
+static HourlyEntry hourly[HOURLY_MAX];
+static int hourlyCount = 0;
+static int64_t hourBeingAveraged = -1;  // UTC hour number (utc / 3600)
+static int32_t hourSum = 0;
+static int hourSamples = 0;
+static WateringEvent events[EVENTS_MAX];
+static int eventCount = 0;
+
+static void loadHourlyAndEvents() {
+  hourlyCount = loadRecords("hourly", hourly, sizeof(HourlyEntry), HOURLY_MAX);
+  eventCount = loadRecords("events", events, sizeof(WateringEvent), EVENTS_MAX);
+  logMsg("flash: %d hourly averages and %d watering events restored", hourlyCount, eventCount);
+}
+
+static void flushHour() {
+  if (hourSamples == 0) return;
+  HourlyEntry e = {(uint32_t)(hourBeingAveraged * 3600), (int8_t)((hourSum + hourSamples / 2) / hourSamples)};
+  hourSum = 0;
+  hourSamples = 0;
+  appendRecord(hourly, hourlyCount, sizeof(HourlyEntry), HOURLY_MAX, &e, nowUtc() - HOURLY_KEEP_S);
+  saveRecords("hourly", hourly, hourlyCount, sizeof(HourlyEntry));
+}
+
+static void addHourlySample(int avg) {
+  int64_t hour = nowUtc() / 3600;
+  if (hourSamples && hour != hourBeingAveraged) flushHour();
+  hourBeingAveraged = hour;
+  hourSum += avg;
+  hourSamples++;
+}
+
+static void hourlyTick() {
+  if (hourSamples && clockSynced && nowUtc() / 3600 != hourBeingAveraged) flushHour();
+}
+
+static void recordWateringEvent(bool completed) {
+  if (!clockSynced) return;
+  WateringEvent e = {(uint32_t)nowUtc(), (uint8_t)completed, (uint8_t)wateringReason};
+  appendRecord(events, eventCount, sizeof(WateringEvent), EVENTS_MAX, &e, 0);
+  saveRecords("events", events, eventCount, sizeof(WateringEvent));
 }
 
 // ---- Radio -----------------------------------------------------------------
@@ -822,9 +906,14 @@ static void closeWindow() {
   else snprintf(avgStr, sizeof(avgStr), "n/a");
   logMsg("DECISION over %lu readings in %s: avg=%s%s", (unsigned long)packets,
        fmtDuration(span).c_str(), avgStr, sensorsToString(pkt, false).c_str());
+  haveWindow = true;
+  lastWindowPacket = pkt;
+  lastWindowAvgAny = avg;
+  lastWindowClosedAt = uptimeS();
   if (avg >= 0 && clockSynced) {
     lastWindowAvg = avg;
     lastWindowAt = nowUtc();
+    addHourlySample(avg);
   }
 
   if (watering) {
@@ -872,6 +961,9 @@ static void heartbeat() {
        reading.c_str(), (unsigned long)packetsReceived, (unsigned long)packetsMissed,
        (unsigned long)packetsDuplicate, (unsigned long)(droppedWrongSize + droppedWrongSender),
        radioOk ? "" : " | RADIO DOWN", clockSynced ? "" : " | CLOCK NOT SET");
+  if (wifiUp) logMsg("HEARTBEAT wifi ch %d %d dBm | web requests %lu", WiFi.channel(), WiFi.RSSI(), (unsigned long)webRequestCount());
+  else if (!routerOnEspNowChannel) logMsg("HEARTBEAT WIFI OFF: router not on channel %d, web page down", ESPNOW_CHANNEL);
+  else logMsg("HEARTBEAT WIFI DOWN (web page down; retrying)");
   if (pending != PENDING_NONE && !clockSynced) {
     logMsg("WARNING: a watering is queued but the clock isn't set, so it can't be played back on the hour");
   }
@@ -885,9 +977,22 @@ static void heartbeat() {
 static void printStatus() {
   uint32_t since = sinceWaterS();
   Serial.println("--- status ---");
+  uint8_t channel = 0;
+  wifi_second_chan_t second;
+  esp_wifi_get_channel(&channel, &second);
   Serial.printf("uptime: %s   MAC: %s   channel: %d   radio: %s\n",
-                fmtDuration((uint32_t)uptimeS()).c_str(), WiFi.macAddress().c_str(), ESPNOW_CHANNEL,
+                fmtDuration((uint32_t)uptimeS()).c_str(), WiFi.macAddress().c_str(), channel,
                 radioOk ? "OK" : "FAILED");
+  if (wifiUp) {
+    Serial.printf("wifi: connected, IP %s, %d dBm   web: http://%s/ or http://%s.local/ (%lu requests)\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.localIP().toString().c_str(), MDNS_NAME,
+                  (unsigned long)webRequestCount());
+  } else if (!routerOnEspNowChannel) {
+    Serial.printf("wifi: off - \"%s\" isn't on channel %d (the sender's), so no web page; set the router to channel %d\n",
+                  WIFI_SSID, ESPNOW_CHANNEL, ESPNOW_CHANNEL);
+  } else {
+    Serial.println("wifi: not connected (retrying)");
+  }
   Serial.printf("relay: %s (pin %d reads %s)\n",
                 watering ? "ENERGIZED, controller reads DRY (watering)" : "off, controller reads WET",
                 RELAY_PIN, digitalRead(RELAY_PIN) ? "HIGH" : "LOW");
@@ -908,7 +1013,8 @@ static void printStatus() {
     Serial.printf("clock: NOT SET (%s)\n", syncAttempted ? "last sync failed" : "not tried yet");
   }
   Serial.printf("queued: %s   next slot: %s\n", pendingName(pending), slotDescription().c_str());
-  Serial.printf("history: %d of %d entries saved (l to list)\n", historyCount, HISTORY_MAX);
+  Serial.printf("history: %d of %d midnight/noon entries (l to list), %d of %d hourly averages, %d watering events\n",
+                historyCount, HISTORY_MAX, hourlyCount, HOURLY_MAX, eventCount);
   if (haveReading) {
     Serial.printf("last reading: avg=%d%%%s seq=%lu rssi=%d dBm, %s ago\n",
                   lastAverage, sensorsToString(lastPacket, true).c_str(), (unsigned long)lastSeq, lastRssi,
@@ -927,8 +1033,14 @@ static void printSettings() {
   logMsg("settings: water %d min from X:%02d:%02d UTC | dry below %d%% (averaged over %d s) | min gap %d h | forced after %d days",
        WATER_DURATION_MIN, (int)(SLOT_OFFSET_S / 60), (int)(SLOT_OFFSET_S % 60), DRY_THRESHOLD_PCT,
        DECISION_WINDOW_S, MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER);
-  logMsg("settings: clock from %s (fallback %s) via Wi-Fi \"%s\", resync every %d h",
-       TIME_API_URL, NTP_SERVER, WIFI_SSID, CLOCK_RESYNC_H);
+  logMsg("settings: Wi-Fi \"%s\" | web port %d, http://%s.local/ | OTA %s | clock from %s (fallback %s), resync every %d h",
+       WIFI_SSID, WEB_PORT, MDNS_NAME,
+#ifdef OTA_PASSWORD
+       "on",
+#else
+       "off (no OTA_PASSWORD in secrets.h)",
+#endif
+       TIME_API_URL, NTP_SERVER, CLOCK_RESYNC_H);
   logMsg("settings: moisture history at midnight and noon (%s), kept %d days (%d entries)",
        HISTORY_TZ, HISTORY_DAYS, HISTORY_MAX);
   int fitted = 0;
@@ -995,6 +1107,41 @@ static void holdDry() {
        fmtDuration((uint32_t)(uptimeS() - startedAt)).c_str());
 }
 
+#if SIMULATE_SENDER
+static uint32_t simSeq = 0;
+static uint32_t simDryness = 0;
+static unsigned long lastSimMs = 0;
+static bool simSeeded = false;
+
+static void simulateSender() {
+  if (millis() - lastSimMs < 1000) return;
+  lastSimMs = millis();
+  if (watering) simDryness = 0;
+  else simDryness++;
+  MoisturePacket pkt;
+  pkt.seq = simSeq++;
+  for (int i = 0; i < MAX_SENSORS; i++) pkt.raw[i] = (uint16_t)(1850 + i * 30 + simDryness / 10 + random(-6, 7));
+  handlePacket(pkt, -40);
+}
+
+static void seedSimulatedHistory() {
+  if (simSeeded || !clockSynced) return;
+  simSeeded = true;
+  if (hourlyCount > 0) return;
+  int64_t firstHour = nowUtc() / 3600 - HOURLY_MAX;
+  float v = 62;
+  for (int64_t h = firstHour; h < nowUtc() / 3600; h++) {
+    v -= 0.25f;
+    if ((h - firstHour) % 150 == 75) v += 22;
+    if (localTm(h * 3600).tm_hour < 6) continue;
+    HourlyEntry e = {(uint32_t)(h * 3600), (int8_t)v};
+    appendRecord(hourly, hourlyCount, sizeof(HourlyEntry), HOURLY_MAX, &e, 0);
+  }
+  saveRecords("hourly", hourly, hourlyCount, sizeof(HourlyEntry));
+  logMsg("SIMULATE: seeded %d hourly averages", hourlyCount);
+}
+#endif
+
 static void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -1002,7 +1149,7 @@ static void handleSerial() {
       case 'r': relayTest(); break;
       case 'd': holdDry(); break;
       case 's': printStatus(); break;
-      case 'w': logMsg("command: water now"); startWatering("manual"); break;
+      case 'w': logMsg("command: water now"); startWatering(PENDING_MANUAL); break;
       case 'p': logMsg("command: queue a watering for the next slot"); setPending(PENDING_MANUAL); break;
       case 't': logMsg("command: sync clock"); syncClock(); break;
       case 'x': logMsg("command: stop watering"); stopWatering(false); break;
@@ -1021,6 +1168,133 @@ static void handleSerial() {
       default: break;
     }
   }
+}
+
+// ---- Network ---------------------------------------------------------------
+
+// Joins only if the router is on ESPNOW_CHANNEL; the scan covers that channel
+// alone, so the radio never leaves the sender's channel.
+static void tryJoinOnEspNowChannel() {
+  lastWifiCheckAt = uptimeS();
+  int16_t found = WiFi.scanNetworks(false, false, false, 300, ESPNOW_CHANNEL, WIFI_SSID);
+  uint8_t bssid[6];
+  if (found > 0) memcpy(bssid, WiFi.BSSID((uint8_t)0), 6);
+  WiFi.scanDelete();
+  restoreEspNowChannel();
+  if ((found > 0) != routerOnEspNowChannel) {
+    routerOnEspNowChannel = found > 0;
+    if (!routerOnEspNowChannel) {
+      logMsg("WARNING: Wi-Fi \"%s\" not found on channel %d (the sender's); web page off until the router uses "
+           "channel %d. Watering is unaffected.", WIFI_SSID, ESPNOW_CHANNEL, ESPNOW_CHANNEL);
+    }
+  }
+  if (found <= 0) return;
+  logMsg("wifi: \"%s\" is on channel %d; joining", WIFI_SSID, ESPNOW_CHANNEL);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, ESPNOW_CHANNEL, bssid);
+  wifiJoining = true;
+  wifiJoinStartedAt = uptimeS();
+}
+
+static void startNetworkServices() {
+#ifdef OTA_PASSWORD
+  ArduinoOTA.setHostname(MDNS_NAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    logMsg("OTA: firmware upload starting; relay off until the new firmware boots");
+    if (watering) stopWatering(false);
+    setRelayDry(false);
+  });
+  ArduinoOTA.onProgress([](unsigned int, unsigned int) { esp_task_wdt_reset(); });
+  ArduinoOTA.onEnd([]() { logMsg("OTA: upload done; restarting"); });
+  ArduinoOTA.onError([](ota_error_t err) { logMsg("OTA: upload failed (%d)", (int)err); });
+  ArduinoOTA.begin();
+#else
+  MDNS.begin(MDNS_NAME);
+#endif
+  MDNS.addService("http", "tcp", WEB_PORT);
+}
+
+static void wifiTick() {
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected && WiFi.channel() != ESPNOW_CHANNEL) {
+    logMsg("WARNING: router moved to channel %d; leaving Wi-Fi to stay on the sender's channel %d",
+         WiFi.channel(), ESPNOW_CHANNEL);
+    WiFi.disconnect();
+    restoreEspNowChannel();
+    connected = false;
+  }
+  if (connected) {
+    wifiJoining = false;
+  } else if (wifiJoining && uptimeS() - wifiJoinStartedAt >= WIFI_JOIN_TIMEOUT_S) {
+    logMsg("wifi: join timed out (status %d)", (int)WiFi.status());
+    WiFi.disconnect();
+    restoreEspNowChannel();
+    wifiJoining = false;
+  }
+
+  if (connected != wifiUp) {
+    wifiUp = connected;
+    if (connected) {
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      logMsg("wifi: connected to \"%s\", IP %s, channel %d, %d dBm; web page http://%s/",
+           WIFI_SSID, WiFi.localIP().toString().c_str(), WiFi.channel(), WiFi.RSSI(),
+           WiFi.localIP().toString().c_str());
+      if (!networkServicesStarted) {
+        startNetworkServices();
+        networkServicesStarted = true;
+      }
+    } else {
+      logMsg("wifi: disconnected; checking again every %d s (watering carries on)", WIFI_RETRY_S);
+      restoreEspNowChannel();
+    }
+  }
+  if (!connected && !wifiJoining && uptimeS() - lastWifiCheckAt >= WIFI_RETRY_S) tryJoinOnEspNowChannel();
+#ifdef OTA_PASSWORD
+  if (connected && networkServicesStarted) ArduinoOTA.handle();
+#endif
+}
+
+static WebSnapshot webSnap;
+static unsigned long lastPublishMs = 0;
+
+static void publishWeb() {
+  WebSnapshot &w = webSnap;
+  int64_t now = uptimeS();
+  uint32_t since = sinceWaterS();
+  w.uptimeS = (uint32_t)now;
+  w.clockSynced = clockSynced;
+  w.nowUtc = clockSynced ? nowUtc() : 0;
+  w.wifiRssi = wifiUp ? WiFi.RSSI() : 0;
+
+  w.haveReading = haveWindow;
+  w.readingUtc = haveWindow && clockSynced ? nowUtc() - (now - lastWindowClosedAt) : 0;
+  w.avg = (int8_t)lastWindowAvgAny;
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    uint16_t raw = lastWindowPacket.raw[i];
+    w.sensors[i] = {SENSORS[i].fitted, rawIsValid(raw), (int8_t)rawToPercent(i, raw), raw};
+  }
+  w.senderRssi = lastRssi;
+  w.lastPacketAgeS = haveReading ? (uint32_t)(now - lastReadingAt) : 0;
+  w.packetsReceived = packetsReceived;
+  w.packetsMissed = packetsMissed;
+
+  w.watering = watering;
+  int64_t left = (int64_t)WATER_S - (now - wateringStartedAt);
+  w.wateringLeftS = watering && left > 0 ? (uint32_t)left : 0;
+  w.pending = pending;
+  w.nextSlotUtc = clockSynced && pending != PENDING_NONE ? nextSlotUtc() : 0;
+  w.lastWateredUtc = clockSynced && wateringCount > 0 ? nowUtc() - since : 0;
+  w.wateringCount = wateringCount;
+  w.dryAllowedInS = MIN_GAP_S - min(since, MIN_GAP_S);
+  w.forcedInS = MAX_GAP_S - min(since, MAX_GAP_S);
+
+  w.hourlyCount = hourlyCount;
+  memcpy(w.hourly, hourly, hourlyCount * sizeof(HourlyEntry));
+  w.historyCount = historyCount;
+  memcpy(w.history, history, historyCount * sizeof(HistoryEntry));
+  w.eventCount = eventCount;
+  memcpy(w.events, events, eventCount * sizeof(WateringEvent));
+  webPublish(w);
 }
 
 // ---- Setup -----------------------------------------------------------------
@@ -1045,9 +1319,12 @@ static bool setupRadio() {
   digitalWrite(RF_ANTENNA_SELECT_PIN, USE_EXTERNAL_ANTENNA ? HIGH : LOW);
 
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
+  WiFi.setHostname(MDNS_NAME);
   WiFi.disconnect();
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  restoreEspNowChannel();
 
   uint8_t primary = 0;
   wifi_second_chan_t second;
@@ -1106,6 +1383,7 @@ void setup() {
   lastAttemptHour = prefs.getLong64("attempt_hr", -1);
   applyHistoryTz();
   loadHistory();
+  loadHourlyAndEvents();
   wateringCount = prefs.getULong("count", 0);
   logMsg("flash: %lu waterings so far", (unsigned long)wateringCount);
   if (prefs.getBool("session", false)) {
@@ -1126,6 +1404,7 @@ void setup() {
   setupWatchdog();
 
   radioOk = setupRadio();
+  webBegin();
   if (!radioOk) {
     // Keep running: the fallback timer still waters without the radio.
     logMsg("running on the fallback timer only");
@@ -1136,6 +1415,9 @@ void setup() {
   if (filterSender) logMsg("radio: accepting packets only from %s", macToString(SENDER_MAC).c_str());
   else logMsg("radio: SENDER_MAC not set; accepting packets from any sender");
 
+#if SIMULATE_SENDER
+  logMsg("WARNING: SIMULATE_SENDER is on; readings are generated, not received");
+#endif
   logMsg("ready");
   printStatus();
   printHelp();
@@ -1184,7 +1466,13 @@ void loop() {
   }
   runSlot();
   historyTick();
+  hourlyTick();
+  wifiTick();
   maybeSyncClock();
+  if (millis() - lastPublishMs >= 1000) {
+    lastPublishMs = millis();
+    publishWeb();
+  }
 
   if (now - lastSaveAt >= (int64_t)SAVE_EVERY_S) {
     saveCounter(true, false);
@@ -1195,6 +1483,10 @@ void loop() {
     heartbeat();
   }
 
+#if SIMULATE_SENDER
+  simulateSender();
+  seedSimulatedHistory();
+#endif
   handleSerial();
   delay(10);
 }

@@ -66,6 +66,14 @@
 // Relay test (serial 'r'): seconds in each state, long enough for a meter to settle.
 #define RELAY_TEST_S 20
 
+// Bench testing without a sender: 1 = generate a reading every second (slowly
+// drying, re-wetted by each completed watering) and fill an empty hourly
+// history with 14 days of sample data. Build with -DSIMULATE_SENDER=1 rather
+// than changing it here.
+#ifndef SIMULATE_SENDER
+#define SIMULATE_SENDER 0
+#endif
+
 // ---- Logging ---------------------------------------------------------------
 
 // One-line "still alive" summary this often (real seconds).
@@ -93,9 +101,6 @@
 
 // ---- Clock -----------------------------------------------------------------
 
-// Wi-Fi name and password live in secrets.h (copy secrets.example.h). The
-// receiver joins only for a few seconds per sync, then returns to
-// ESPNOW_CHANNEL; packets sent meanwhile are lost.
 #define TIME_API_URL "https://timeapi.io/api/v1/time/current/utc"
 #define NTP_SERVER "pool.ntp.org"  // used when TIME_API_URL fails
 
@@ -103,13 +108,33 @@
 #define CLOCK_RESYNC_H 6
 #define CLOCK_RETRY_MIN 5
 
-// Give up joining Wi-Fi after this long. Keep well under WATCHDOG_TIMEOUT_S.
-#define WIFI_CONNECT_TIMEOUT_S 15
+// ---- Network ---------------------------------------------------------------
+
+// Wi-Fi name and password (and optional OTA_PASSWORD) live in secrets.h; copy
+// secrets.example.h. The receiver stays on Wi-Fi only while the router is on
+// ESPNOW_CHANNEL; it checks for it every WIFI_RETRY_S and gives up a join
+// after WIFI_JOIN_TIMEOUT_S (keep it under WATCHDOG_TIMEOUT_S).
+#define WIFI_RETRY_S 60
+#define WIFI_JOIN_TIMEOUT_S 15
+
+// Read-only web page and JSON API. On the home network the receiver is also
+// http://MDNS_NAME.local/ and accepts OTA uploads under that name.
+#define WEB_PORT 80
+#define MDNS_NAME "moisture"
+
+// Hourly average moisture kept for the chart (one flash write per hour).
+#define HOURLY_DAYS 14
 
 // ---- Radio -----------------------------------------------------------------
 
-// Wi-Fi channel for ESP-NOW. Must match the sender.
+// Wi-Fi channel for ESP-NOW. Must match the sender, which is fixed on 1. The
+// radio never leaves it except for brief clock syncs, so the web page is only
+// up when the router's 2.4 GHz Wi-Fi is set to this channel (not "auto").
+// Otherwise watering carries on and the clock is synced by joining Wi-Fi for a
+// few seconds at a time, as with no web page.
+#ifndef ESPNOW_CHANNEL
 #define ESPNOW_CHANNEL 1
+#endif
 
 // Accept packets only from this MAC (printed on the sender's serial console).
 // All zeros = accept any sender (fine for bench testing).
