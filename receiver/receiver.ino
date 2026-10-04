@@ -23,15 +23,16 @@
 //     of the fitted sensors, leaving out any reading outside
 //     RAW_VALID_MIN-RAW_VALID_MAX as faulty. Each sensor's readings are
 //     averaged over DECISION_WINDOW_S and one decision is made per window.
-//   - The controller only checks the probe on the hour, so watering is queued
-//     and played back at the next X:59:30 (WATER_LEAD_S before the hour, in
-//     UTC from world time): relay DRY for WATER_DURATION_MIN, then off. It
-//     counts as a watering only once that hold completes.
+//   - The controller only checks the probe every CHECK_EVERY_H hours from
+//     local midnight, so watering is queued and played back WATER_LEAD_S
+//     before its next check (23:59:30, 03:59:30, ... in LOCAL_TZ): relay DRY
+//     for WATER_DURATION_MIN, then off. It counts as a watering only once that
+//     hold completes.
 //   - Average < DRY_THRESHOLD_PCT and at least MIN_HOURS_BETWEEN_WATERING
 //     since the last watering -> queue. A later moist window cancels it.
 //   - MAX_DAYS_WITHOUT_WATER since the last watering -> queue, reading or not,
-//     retried every hour until one completes.
-//   - One attempt per hour. A failed attempt (stopped, reset) discards the
+//     retried at every check until one completes.
+//   - One attempt per check. A failed attempt (stopped, reset) discards the
 //     queued signal and the current window; only new readings can queue again.
 //   - The last watering is saved to flash as UTC, so time powered off counts.
 //     Before the clock is set, a since-watering counter saved hourly is used.
@@ -52,8 +53,8 @@
 //     the NC contact, which also reads WET.
 //   - Each session is hard-capped at 7 min (MAX_WATERING_SESSION_S), by loop()
 //     and by an independent timer that forces the relay off.
-//   - The hour of each attempt is saved to flash before the relay turns on, so
-//     a reset mid-session can't repeat it; the watchdog resets the board if
+//   - The check of each attempt is saved to flash before the relay turns on,
+//     so a reset mid-session can't repeat it; the watchdog resets the board if
 //     loop() stalls.
 //   - Fit a 10k pull-down from the relay module's IN to GND so the relay stays
 //     off in the fraction of a second before the firmware takes the pin.
@@ -64,10 +65,12 @@
 // log still proves the board is alive. The LED blinks on each packet and stays
 // on while watering.
 //
-// Serial commands (115200 baud): s = status, w = water now, x = stop watering,
+// Serial commands (115200 baud): s = status, w = water now, x = stop watering
+// (or cancel a queued one),
 // c = reset counter (as if just watered), f = jump counter to the fallback
 // limit, p = queue a watering for the next slot, t = sync clock now, l = list
-// moisture history, r = relay test, d = hold relay DRY until any key, h = help.
+// moisture history, n = scan for the Wi-Fi network on all channels, r = relay
+// test, d = hold relay DRY until any key, h = help.
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -108,9 +111,9 @@ static const uint32_t MAX_GAP_S = (uint32_t)MAX_DAYS_WITHOUT_WATER * 24UL * HOUR
 static const uint32_t WATER_S = (uint32_t)WATER_DURATION_MIN * 60UL;
 static const uint32_t SAVE_EVERY_S = HOUR_S;
 static const uint32_t NO_READING_WARN_S = (uint32_t)NO_READING_WARN_H * HOUR_S;
-static const int64_t SLOT_OFFSET_S = 3600 - WATER_LEAD_S;
+static_assert(CHECK_EVERY_H > 0 && 24 % CHECK_EVERY_H == 0, "CHECK_EVERY_H must divide 24");
 static_assert(WATER_LEAD_S > 0 && WATER_LEAD_S < WATER_DURATION_MIN * 60,
-              "the DRY hold must start before the hour and last past it");
+              "the DRY hold must start before the check and last past it");
 
 static Preferences prefs;
 
@@ -131,8 +134,8 @@ static const char *clockSource = "";
 static int64_t restoredLastWaterUtc = 0;
 
 static PendingReason pending = PENDING_NONE;
-// UTC hour (utc / 3600) whose X:59:30 slot was last used; -1 = none.
-static int64_t lastAttemptHour = -1;
+// UTC time of the controller check whose slot was last used; -1 = none.
+static int64_t lastAttemptCheck = -1;
 
 static bool watering = false;
 static PendingReason wateringReason = PENDING_NONE;
@@ -204,6 +207,26 @@ static String fmtUtc(int64_t utc, bool withDate) {
   gmtime_r(&t, &tm);
   char buf[24];
   strftime(buf, sizeof(buf), withDate ? "%Y-%m-%d %H:%M:%SZ" : "%H:%M:%SZ", &tm);
+  return String(buf);
+}
+
+// configTime() overwrites TZ, so this is reapplied after every NTP sync.
+static void applyLocalTz() {
+  setenv("TZ", LOCAL_TZ, 1);
+  tzset();
+}
+
+static struct tm localTm(int64_t utc) {
+  time_t t = (time_t)utc;
+  struct tm tm;
+  localtime_r(&t, &tm);
+  return tm;
+}
+
+static String fmtLocal(int64_t utc) {
+  struct tm tm = localTm(utc);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &tm);
   return String(buf);
 }
 
@@ -427,7 +450,7 @@ static bool fetchNtp(int64_t &utc) {
   }
   if (ok) utc = (int64_t)time(nullptr);
   esp_sntp_stop();
-  applyHistoryTz();
+  applyLocalTz();
   if (!ok) logMsg("clock: NTP (%s) gave no answer", NTP_SERVER);
   return ok;
 }
@@ -506,34 +529,44 @@ static void syncClock() {
               clockSynced ? " (keeping the current clock)" : "");
 }
 
+// First controller check strictly after utc. UTC hours line up with LOCAL_TZ
+// hours (whole-hour offsets), so only whole UTC hours need testing.
+static int64_t checkAfter(int64_t utc) {
+  int64_t t = (utc / 3600 + 1) * 3600;
+  for (int i = 0; i < 48 && localTm(t).tm_hour % CHECK_EVERY_H != 0; i++) t += 3600;
+  return t;
+}
+
 static bool nearSlot() {
-  return clockSynced && nowUtc() % 3600 >= SLOT_OFFSET_S - 120;
+  if (!clockSynced) return false;
+  int64_t utc = nowUtc();
+  return checkAfter(utc) - utc <= WATER_LEAD_S + 120;
 }
 
 static void maybeSyncClock() {
-  if (wifiJoining || watering || nearSlot()) return;
+  if (wifiJoining || watering) return;
   if (syncAttempted) {
     int64_t wait = lastSyncOk ? (int64_t)CLOCK_RESYNC_H * 3600 : (int64_t)CLOCK_RETRY_MIN * 60;
     if (uptimeS() - lastSyncAttemptAt < wait) return;
   }
+  if (nearSlot()) return;
   syncClock();
 }
 
-// ---- Hourly slot -----------------------------------------------------------
+// ---- Watering slot ---------------------------------------------------------
 
-// UTC start of the next slot (X:59:30) that can still be used.
+// UTC start of the next slot (WATER_LEAD_S before a check) that can still be used.
 static int64_t nextSlotUtc() {
-  int64_t utc = nowUtc();
-  int64_t slot = utc - utc % 3600 + SLOT_OFFSET_S;
-  if (utc / 3600 == lastAttemptHour) slot += 3600;
-  return slot;
+  int64_t check = checkAfter(nowUtc());
+  if (check == lastAttemptCheck) check = checkAfter(check);
+  return check - WATER_LEAD_S;
 }
 
 static String slotDescription() {
   if (!clockSynced) return "waiting for the clock";
   int64_t slot = nextSlotUtc();
   int64_t wait = slot - nowUtc();
-  return fmtUtc(slot, false) + (wait > 0 ? ", in " + fmtDuration((uint32_t)wait) : String(", now"));
+  return fmtLocal(slot) + (wait > 0 ? ", in " + fmtDuration((uint32_t)wait) : String(", now"));
 }
 
 static void setPending(PendingReason r) {
@@ -545,18 +578,18 @@ static void setPending(PendingReason r) {
 static void runSlot() {
   if (pending == PENDING_NONE || watering || !clockSynced) return;
   int64_t utc = nowUtc();
-  if (utc % 3600 < SLOT_OFFSET_S || utc / 3600 == lastAttemptHour) return;
+  int64_t check = checkAfter(utc);
+  if (check - utc > WATER_LEAD_S || check == lastAttemptCheck) return;
 
-  lastAttemptHour = utc / 3600;
-  prefs.putLong64("attempt_hr", lastAttemptHour);
+  lastAttemptCheck = check;
+  prefs.putLong64("attempt_chk", lastAttemptCheck);
   PendingReason reason = pending;
   pending = PENDING_NONE;
   if (reason == PENDING_DRY && sinceWaterS() < MIN_GAP_S) {
     logMsg("slot: queued dry signal dropped; watered %.1f h ago", asHours(sinceWaterS()));
     return;
   }
-  logMsg("slot: playing back the queued watering for the %s check",
-       fmtUtc(utc - utc % 3600 + 3600, false).c_str());
+  logMsg("slot: playing back the queued watering for the %s check", fmtLocal(check).c_str());
   startWatering(reason);
 }
 
@@ -608,31 +641,11 @@ static const int64_t HISTORY_KEEP_S = (int64_t)HISTORY_DAYS * 86400;
 // Oldest first.
 static HistoryEntry history[HISTORY_MAX];
 static int historyCount = 0;
-// Half-day (midnight-noon, noon-midnight in HISTORY_TZ) last checked; -1 = not yet.
+// Half-day (midnight-noon, noon-midnight in LOCAL_TZ) last checked; -1 = not yet.
 static int64_t historyHalfDay = -1;
 // Latest window average and its UTC time; lastWindowAt 0 = none.
 static int lastWindowAvg = -1;
 static int64_t lastWindowAt = 0;
-
-// configTime() overwrites TZ, so this is reapplied after every NTP sync.
-static void applyHistoryTz() {
-  setenv("TZ", HISTORY_TZ, 1);
-  tzset();
-}
-
-static struct tm localTm(int64_t utc) {
-  time_t t = (time_t)utc;
-  struct tm tm;
-  localtime_r(&t, &tm);
-  return tm;
-}
-
-static String fmtLocal(int64_t utc) {
-  struct tm tm = localTm(utc);
-  char buf[32];
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M %Z", &tm);
-  return String(buf);
-}
 
 static int64_t halfDayOf(int64_t utc) {
   struct tm tm = localTm(utc);
@@ -670,7 +683,7 @@ static void historyTick() {
 
 static void printHistory() {
   Serial.printf("--- moisture history: saved at midnight and noon (%s), last %d days ---\n",
-                HISTORY_TZ, HISTORY_DAYS);
+                LOCAL_TZ, HISTORY_DAYS);
   if (historyCount == 0) Serial.println("(none yet)");
   for (int i = 0; i < historyCount; i++) {
     Serial.printf("%s  %3d%%  (measured %s)\n", fmtLocal(history[i].savedUtc).c_str(), history[i].avg,
@@ -965,7 +978,7 @@ static void heartbeat() {
   else if (!routerOnEspNowChannel) logMsg("HEARTBEAT WIFI OFF: router not on channel %d, web page down", ESPNOW_CHANNEL);
   else logMsg("HEARTBEAT WIFI DOWN (web page down; retrying)");
   if (pending != PENDING_NONE && !clockSynced) {
-    logMsg("WARNING: a watering is queued but the clock isn't set, so it can't be played back on the hour");
+    logMsg("WARNING: a watering is queued but the clock isn't set, so it can't be played back at a check");
   }
 
   uint32_t silentFor = haveReading ? (uint32_t)(uptimeS() - lastReadingAt) : (uint32_t)uptimeS();
@@ -1030,8 +1043,8 @@ static void printStatus() {
 }
 
 static void printSettings() {
-  logMsg("settings: water %d min from X:%02d:%02d UTC | dry below %d%% (averaged over %d s) | min gap %d h | forced after %d days",
-       WATER_DURATION_MIN, (int)(SLOT_OFFSET_S / 60), (int)(SLOT_OFFSET_S % 60), DRY_THRESHOLD_PCT,
+  logMsg("settings: controller checks every %d h from 00:00 %s; relay DRY %d min from %d s before | dry below %d%% (averaged over %d s) | min gap %d h | forced after %d days",
+       CHECK_EVERY_H, LOCAL_TZ, WATER_DURATION_MIN, WATER_LEAD_S, DRY_THRESHOLD_PCT,
        DECISION_WINDOW_S, MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER);
   logMsg("settings: Wi-Fi \"%s\" | web port %d, http://%s.local/ | OTA %s | clock from %s (fallback %s), resync every %d h",
        WIFI_SSID, WEB_PORT, MDNS_NAME,
@@ -1042,7 +1055,7 @@ static void printSettings() {
 #endif
        TIME_API_URL, NTP_SERVER, CLOCK_RESYNC_H);
   logMsg("settings: moisture history at midnight and noon (%s), kept %d days (%d entries)",
-       HISTORY_TZ, HISTORY_DAYS, HISTORY_MAX);
+       LOCAL_TZ, HISTORY_DAYS, HISTORY_MAX);
   int fitted = 0;
   for (int i = 0; i < MAX_SENSORS; i++) {
     if (!SENSORS[i].fitted) continue;
@@ -1058,8 +1071,8 @@ static void printSettings() {
 }
 
 static void printHelp() {
-  Serial.println("commands: s=status  w=water now  p=queue for next slot  x=stop watering  c=reset counter  "
-                 "f=force fallback  t=sync clock  l=history  r=relay test  d=hold dry  h=help");
+  Serial.println("commands: s=status  w=water now  p=queue for next slot  x=stop or cancel watering  c=reset counter  "
+                 "f=force fallback  t=sync clock  l=history  n=Wi-Fi scan  r=relay test  d=hold dry  h=help");
 }
 
 // Bench test: toggle the relay every RELAY_TEST_S seconds so the fake-probe resistance can
@@ -1142,6 +1155,21 @@ static void seedSimulatedHistory() {
 }
 #endif
 
+// Full scan of every channel (ESP-NOW packets are missed for a few seconds).
+static void listWifiNetworks() {
+  logMsg("scan: all channels for \"%s\"...", WIFI_SSID);
+  int16_t n = WiFi.scanNetworks(false, true);
+  int matches = 0;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) != WIFI_SSID) continue;
+    matches++;
+    logMsg("scan:   channel %2d  %d dBm  access point %s", WiFi.channel(i), WiFi.RSSI(i), WiFi.BSSIDstr(i).c_str());
+  }
+  logMsg("scan: %d access point(s) with that name, %d networks in total", matches, n < 0 ? 0 : n);
+  WiFi.scanDelete();
+  restoreEspNowChannel();
+}
+
 static void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -1152,7 +1180,15 @@ static void handleSerial() {
       case 'w': logMsg("command: water now"); startWatering(PENDING_MANUAL); break;
       case 'p': logMsg("command: queue a watering for the next slot"); setPending(PENDING_MANUAL); break;
       case 't': logMsg("command: sync clock"); syncClock(); break;
-      case 'x': logMsg("command: stop watering"); stopWatering(false); break;
+      case 'x':
+        if (!watering && pending != PENDING_NONE) {
+          logMsg("command: queued watering (%s) cancelled", pendingName(pending));
+          pending = PENDING_NONE;
+        } else {
+          logMsg("command: stop watering");
+          stopWatering(false);
+        }
+        break;
       case 'c':
         lastWaterAt = uptimeS();
         saveCounter(false, true);
@@ -1164,6 +1200,7 @@ static void handleSerial() {
         logMsg("command: counter set to the fallback limit; forced watering next");
         break;
       case 'l': printHistory(); break;
+      case 'n': listWifiNetworks(); break;
       case 'h': case '?': printHelp(); break;
       default: break;
     }
@@ -1380,8 +1417,9 @@ void setup() {
   if (restoredLastWaterUtc > 0) {
     logMsg("flash: last watering was %s; applied once the clock is set", fmtUtc(restoredLastWaterUtc, true).c_str());
   }
-  lastAttemptHour = prefs.getLong64("attempt_hr", -1);
-  applyHistoryTz();
+  prefs.remove("attempt_hr");
+  lastAttemptCheck = prefs.getLong64("attempt_chk", -1);
+  applyLocalTz();
   loadHistory();
   loadHourlyAndEvents();
   wateringCount = prefs.getULong("count", 0);

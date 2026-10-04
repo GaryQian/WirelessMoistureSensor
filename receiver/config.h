@@ -7,13 +7,18 @@
 
 // ---- Schedule --------------------------------------------------------------
 
-// The controller looks at the probe once an hour, on the hour (X:00), so a
-// decision to water is queued and played back at the next hour: the relay
-// goes DRY WATER_LEAD_S before X:00 and stays DRY for WATER_DURATION_MIN.
-// A watering only counts once that hold has run to the end. The hour comes
-// from world time (UTC) over Wi-Fi, so the controller's clock must be on a
-// whole-hour time zone and roughly right.
+// The controller looks at the probe every CHECK_EVERY_H hours on the hour,
+// counted from midnight in LOCAL_TZ (00:00, 04:00, 08:00, ...), so a decision
+// to water is queued and played back at its next check: the relay goes DRY
+// WATER_LEAD_S before the check and stays DRY for WATER_DURATION_MIN. A
+// watering only counts once that hold has run to the end. The time comes from
+// world time over Wi-Fi, so the controller's clock must be roughly right.
+#define CHECK_EVERY_H 4
 #define WATER_LEAD_S 30
+
+// Local time zone (POSIX TZ string) for the controller's checks and the
+// midnight/noon history: US Pacific with daylight saving (PST/PDT).
+#define LOCAL_TZ "PST8PDT,M3.2.0,M11.1.0"
 
 // How long the relay signals "dry" (real minutes, not affected by TIME_SCALE).
 #define WATER_DURATION_MIN 5
@@ -86,13 +91,11 @@
 // scaled by TIME_SCALE). Lights come on daily, so a gap over a day is suspect.
 #define NO_READING_WARN_H 26
 
-// Moisture history (serial 'l'): at midnight and noon in HISTORY_TZ, the most
+// Moisture history (serial 'l'): at midnight and noon in LOCAL_TZ, the most
 // recent average of the fitted sensors is saved to flash with the time it was
 // measured (the lights may be off at midnight). Nothing is saved if there has
 // been no new reading since the last save. Entries older than HISTORY_DAYS are
-// dropped. HISTORY_TZ is a POSIX TZ string; this one is US Pacific with
-// daylight saving (PST/PDT).
-#define HISTORY_TZ "PST8PDT,M3.2.0,M11.1.0"
+// dropped.
 #define HISTORY_DAYS 14
 
 // Flash the LED briefly on every packet received (the LED stays on while
