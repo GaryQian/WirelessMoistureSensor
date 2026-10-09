@@ -1,9 +1,0 @@
-{
-  "additionalFiles": "../..,../..,../..,../..,../..,../..",
-  "compiler.optimization_flags": "-Os",
-  "customBuildProperties": "upload.maximum_size=1966080",
-  "fqbn": "esp32:esp32:XIAO_ESP32C6",
-  "hardwareFolders": "/Users/gqian/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12,/Users/gqian/Library/Arduino15/packages/esp32/hardware/esp32/3.3.12",
-  "otherLibrariesFolders": "/Users/gqian/Documents/Arduino/libraries",
-  "sketchLocation": "/Users/gqian/git/WirelessMoistureSensor/receiver"
-}
