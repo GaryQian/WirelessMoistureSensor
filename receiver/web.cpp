@@ -61,7 +61,8 @@ static String currentJson() {
   appendField(j, "time"); appendIso(j, snap.clockSynced ? snap.nowUtc : 0);
   appendField(j, "clockSet"); j += snap.clockSynced ? "true" : "false";
   appendField(j, "uptimeS"); j += (unsigned long)snap.uptimeS;
-  appendField(j, "thresholdPct"); j += DRY_THRESHOLD_PCT;
+  appendField(j, "startPct"); j += WATER_START_PCT;
+  appendField(j, "stopPct"); j += WATER_STOP_PCT;
 
   appendField(j, "reading");
   if (snap.haveReading) {
@@ -98,7 +99,13 @@ static String currentJson() {
   appendField(j, "nextSlot"); appendIso(j, snap.nextSlotUtc);
   appendField(j, "lastWatered"); appendIso(j, snap.lastWateredUtc);
   appendField(j, "count"); j += (unsigned long)snap.wateringCount;
-  appendField(j, "dryAllowedInS"); j += (unsigned long)snap.dryAllowedInS;
+  appendField(j, "cycle");
+  j += '{';
+  appendField(j, "active"); j += snap.cycleActive ? "true" : "false";
+  appendField(j, "waterings"); j += (unsigned long)snap.cycleWaterings;
+  appendField(j, "maxWaterings"); j += MAX_CYCLE_WATERINGS;
+  appendField(j, "nextAllowed"); appendIso(j, snap.nextCycleAllowedUtc);
+  j += '}';
   appendField(j, "forcedInS"); j += (unsigned long)snap.forcedInS;
   j += '}';
 

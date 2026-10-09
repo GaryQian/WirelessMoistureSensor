@@ -23,13 +23,21 @@
 // How long the relay signals "dry" (real minutes, not affected by TIME_SCALE).
 #define WATER_DURATION_MIN 5
 
-// Water when the average moisture of the fitted sensors is below this.
+// Watering cycle on the average moisture of the fitted sensors: at or below
+// WATER_START_PCT a cycle starts and a watering is queued for every controller
+// check until the average reads above WATER_STOP_PCT; then it waits for
+// WATER_START_PCT again.
 // Reference points for sensor A0 (2026-09-28, full list in SENSORS below):
 //   bag-dry 0% | mostly dry 7% | damp, good watering point 31% (raw ~2080)
 //   | just under saturated 86% | saturated 100%
-// Measured in rootless soil; real bed soil may read a little differently, so
-// check the daily readings after installing and adjust.
-#define DRY_THRESHOLD_PCT 40
+#define WATER_START_PCT 35
+#define WATER_STOP_PCT 50
+
+// A cycle ends after this many waterings even if the average never passed
+// WATER_STOP_PCT, and at most one cycle starts per MIN_HOURS_BETWEEN_CYCLES
+// (counted from the previous cycle's start).
+#define MAX_CYCLE_WATERINGS 3
+#define MIN_HOURS_BETWEEN_CYCLES 24
 
 // Readings are averaged over this many real seconds (per sensor) before each
 // watering decision. The sender reports every second.
@@ -37,9 +45,6 @@
 
 // Queue a watering regardless of moisture after this many days without one.
 #define MAX_DAYS_WITHOUT_WATER 10
-
-// Never water more often than this (limits watering to once per day).
-#define MIN_HOURS_BETWEEN_WATERING 20
 
 // Test speed-up: divides the length of an "hour" (and so a "day").
 //   1   = normal

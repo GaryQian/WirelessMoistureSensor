@@ -28,12 +28,15 @@
 //     before its next check (23:59:30, 03:59:30, ... in LOCAL_TZ): relay DRY
 //     for WATER_DURATION_MIN, then off. It counts as a watering only once that
 //     hold completes.
-//   - Average < DRY_THRESHOLD_PCT and at least MIN_HOURS_BETWEEN_WATERING
-//     since the last watering -> queue. A later moist window cancels it.
+//   - Average <= WATER_START_PCT starts a watering cycle: a watering is queued
+//     for every check until an average reads above WATER_STOP_PCT, or for at
+//     most MAX_CYCLE_WATERINGS; then it waits for WATER_START_PCT again. At
+//     most one cycle starts per MIN_HOURS_BETWEEN_CYCLES. Cycle state is saved
+//     to flash.
 //   - MAX_DAYS_WITHOUT_WATER since the last watering -> queue, reading or not,
 //     retried at every check until one completes.
 //   - One attempt per check. A failed attempt (stopped, reset) discards the
-//     queued signal and the current window; only new readings can queue again.
+//     queued signal and the current window; only a new reading can queue again.
 //   - The last watering is saved to flash as UTC, so time powered off counts.
 //     Before the clock is set, a since-watering counter saved hourly is used.
 //   - The clock comes from TIME_API_URL (NTP_SERVER as fallback) every
@@ -106,7 +109,6 @@ static_assert(WATER_DURATION_MIN * 60 <= MAX_WATERING_SESSION_S,
               "WATER_DURATION_MIN must be 7 minutes or less");
 
 static const uint32_t HOUR_S = 3600UL / TIME_SCALE;
-static const uint32_t MIN_GAP_S = (uint32_t)MIN_HOURS_BETWEEN_WATERING * HOUR_S;
 static const uint32_t MAX_GAP_S = (uint32_t)MAX_DAYS_WITHOUT_WATER * 24UL * HOUR_S;
 static const uint32_t WATER_S = (uint32_t)WATER_DURATION_MIN * 60UL;
 static const uint32_t SAVE_EVERY_S = HOUR_S;
@@ -134,6 +136,11 @@ static const char *clockSource = "";
 static int64_t restoredLastWaterUtc = 0;
 
 static PendingReason pending = PENDING_NONE;
+static bool cycleActive = false;
+static uint32_t cycleWaterings = 0;
+static int64_t cycleStartedUtc = 0;
+// Set by a failed attempt; cleared by the next decision window.
+static bool needFreshReading = false;
 // UTC time of the controller check whose slot was last used; -1 = none.
 static int64_t lastAttemptCheck = -1;
 
@@ -340,6 +347,46 @@ static void onCutoffTimer(void *) {
 static void discardWindow();
 static void recordWateringEvent(bool completed);
 
+static void saveCycle() {
+  prefs.putBool("cycle", cycleActive);
+  prefs.putULong("cycle_n", cycleWaterings);
+  prefs.putLong64("cycle_start", cycleStartedUtc);
+}
+
+// UTC time from which a new cycle may start; 0 = any time.
+static int64_t nextCycleAllowedUtc() {
+  return cycleStartedUtc > 0 ? cycleStartedUtc + (int64_t)MIN_HOURS_BETWEEN_CYCLES * HOUR_S : 0;
+}
+
+static void startCycle(int avg) {
+  cycleActive = true;
+  cycleWaterings = 0;
+  cycleStartedUtc = nowUtc();
+  saveCycle();
+  logMsg("  -> CYCLE START: %d%% <= %d%%; watering at every check until above %d%%", avg, WATER_START_PCT, WATER_STOP_PCT);
+}
+
+static void endCycle(const char *why) {
+  cycleActive = false;
+  saveCycle();
+  if (pending == PENDING_DRY) pending = PENDING_NONE;
+  logMsg("  -> CYCLE END: %s after %lu watering(s)", why, (unsigned long)cycleWaterings);
+}
+
+static void countCycleWatering() {
+  cycleWaterings++;
+  saveCycle();
+  if (cycleWaterings < MAX_CYCLE_WATERINGS) return;
+  char why[64];
+  snprintf(why, sizeof(why), "reached %d waterings without passing %d%%", MAX_CYCLE_WATERINGS, WATER_STOP_PCT);
+  endCycle(why);
+}
+
+// Keeps a watering queued for the next check while a cycle runs.
+static void cycleTick() {
+  if (cycleActive && !watering && pending == PENDING_NONE && !needFreshReading) setPending(PENDING_DRY);
+}
+
 static void startWatering(PendingReason reason) {
   if (watering) {
     logMsg("already watering; '%s' ignored", pendingName(reason));
@@ -372,6 +419,7 @@ static void stopWatering(bool completed) {
   if (cutoffTimer) esp_timer_stop(cutoffTimer);
   prefs.putBool("session", false);
   pending = PENDING_NONE;
+  needFreshReading = !completed;
   discardWindow();
   recordWateringEvent(completed);
   uint32_t ran = (uint32_t)(uptimeS() - wateringStartedAt);
@@ -382,13 +430,11 @@ static void stopWatering(bool completed) {
     saveCounter(false, true);
     logMsg("WATERING DONE after %s; counted as watered (total waterings: %lu)",
          fmtDuration(ran).c_str(), (unsigned long)wateringCount);
+    if (cycleActive) countCycleWatering();
   } else {
-    logMsg("WATERING FAILED: stopped after %s; not counted, signal discarded, waiting for new readings",
+    logMsg("WATERING FAILED: stopped after %s; not counted, signal discarded, waiting for a new reading",
          fmtDuration(ran).c_str());
   }
-  uint32_t since = sinceWaterS();
-  logMsg("next: dry reading can queue in %.1f h; forced watering queued in %.1f h",
-       asHours(MIN_GAP_S - min(since, MIN_GAP_S)), asHours(MAX_GAP_S - min(since, MAX_GAP_S)));
 }
 
 // ---- Clock -----------------------------------------------------------------
@@ -585,10 +631,6 @@ static void runSlot() {
   prefs.putLong64("attempt_chk", lastAttemptCheck);
   PendingReason reason = pending;
   pending = PENDING_NONE;
-  if (reason == PENDING_DRY && sinceWaterS() < MIN_GAP_S) {
-    logMsg("slot: queued dry signal dropped; watered %.1f h ago", asHours(sinceWaterS()));
-    return;
-  }
   logMsg("slot: playing back the queued watering for the %s check", fmtLocal(check).c_str());
   startWatering(reason);
 }
@@ -929,31 +971,31 @@ static void closeWindow() {
     addHourlySample(avg);
   }
 
-  if (watering) {
-    logMsg("  -> already watering");
-    return;
-  }
-
-  uint32_t since = sinceWaterS();
   if (avg < 0) {
+    uint32_t since = sinceWaterS();
     logMsg("  -> no usable sensor, no decision (forced watering in %.1f h still applies)",
          asHours(MAX_GAP_S - min(since, MAX_GAP_S)));
-  } else if (avg >= DRY_THRESHOLD_PCT) {
-    if (pending == PENDING_DRY) {
-      pending = PENDING_NONE;
-      logMsg("  -> moist (%d%% >= %d%%); queued dry signal cancelled", avg, DRY_THRESHOLD_PCT);
+    return;
+  }
+  needFreshReading = false;
+  if (cycleActive) {
+    if (avg > WATER_STOP_PCT) {
+      char why[48];
+      snprintf(why, sizeof(why), "%d%% > %d%%", avg, WATER_STOP_PCT);
+      endCycle(why);
     } else {
-      logMsg("  -> moist (%d%% >= %d%%), no watering", avg, DRY_THRESHOLD_PCT);
+      logMsg("  -> cycle on (%d%%, stops above %d%%): %lu of max %d waterings done%s", avg, WATER_STOP_PCT,
+           (unsigned long)cycleWaterings, MAX_CYCLE_WATERINGS, watering ? ", watering now" : "");
     }
-  } else if (since < MIN_GAP_S) {
-    logMsg("  -> dry (%d%% < %d%%) but watered %.1f h ago; allowed again in %.1f h",
-         avg, DRY_THRESHOLD_PCT, asHours(since), asHours(MIN_GAP_S - since));
-  } else if (pending != PENDING_NONE) {
-    logMsg("  -> dry (%d%% < %d%%); already queued (%s) for %s", avg, DRY_THRESHOLD_PCT,
-         pendingName(pending), slotDescription().c_str());
+  } else if (avg > WATER_START_PCT) {
+    logMsg("  -> %d%%, no watering (cycle starts at %d%% or below)", avg, WATER_START_PCT);
+  } else if (!clockSynced) {
+    logMsg("  -> %d%% <= %d%% but the clock isn't set; no cycle yet", avg, WATER_START_PCT);
+  } else if (nowUtc() < nextCycleAllowedUtc()) {
+    logMsg("  -> %d%% <= %d%% but the last cycle started %s; next one allowed %s", avg, WATER_START_PCT,
+         fmtLocal(cycleStartedUtc).c_str(), fmtLocal(nextCycleAllowedUtc()).c_str());
   } else {
-    logMsg("  -> dry (%d%% < %d%%) and %.1f h since last watering", avg, DRY_THRESHOLD_PCT, asHours(since));
-    setPending(PENDING_DRY);
+    startCycle(avg);
   }
 }
 
@@ -964,13 +1006,14 @@ static void heartbeat() {
   String relay = watering
     ? "WATERING (" + fmtDuration(WATER_S - (uint32_t)(uptimeS() - wateringStartedAt)) + " left)"
     : "WET";
-  String allowed = since >= MIN_GAP_S ? "now" : "in " + String(asHours(MIN_GAP_S - since), 1) + " h";
+  String cycle = cycleActive ? "on, " + String(cycleWaterings) + "/" + String(MAX_CYCLE_WATERINGS) + " waterings"
+               : String("off");
   String reading = haveReading
     ? (lastAverage >= 0 ? String(lastAverage) + "%" : String("n/a")) + " " + fmtDuration((uint32_t)(uptimeS() - lastReadingAt)) + " ago"
     : "none since boot";
   String queued = pending == PENDING_NONE ? String("none") : String(pendingName(pending)) + " @ " + slotDescription();
-  logMsg("HEARTBEAT relay=%s | queued %s | since water %.1f h, dry-water %s, forced in %.1f h | last reading %s | rx %lu missed %lu dup %lu dropped %lu%s%s",
-       relay.c_str(), queued.c_str(), asHours(since), allowed.c_str(), asHours(MAX_GAP_S - min(since, MAX_GAP_S)),
+  logMsg("HEARTBEAT relay=%s | cycle %s | queued %s | since water %.1f h, forced in %.1f h | last reading %s | rx %lu missed %lu dup %lu dropped %lu%s%s",
+       relay.c_str(), cycle.c_str(), queued.c_str(), asHours(since), asHours(MAX_GAP_S - min(since, MAX_GAP_S)),
        reading.c_str(), (unsigned long)packetsReceived, (unsigned long)packetsMissed,
        (unsigned long)packetsDuplicate, (unsigned long)(droppedWrongSize + droppedWrongSender),
        radioOk ? "" : " | RADIO DOWN", clockSynced ? "" : " | CLOCK NOT SET");
@@ -1013,9 +1056,17 @@ static void printStatus() {
     Serial.printf("watering remaining: %s\n",
                   fmtDuration(WATER_S - (uint32_t)(uptimeS() - wateringStartedAt)).c_str());
   }
-  Serial.printf("since last watering: %.1f h   (dry-watering allowed after %d h, forced at %d days = %lu h)\n",
-                asHours(since), MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER,
-                (unsigned long)MAX_DAYS_WITHOUT_WATER * 24UL);
+  Serial.printf("since last watering: %.1f h   (forced at %d days = %lu h)\n",
+                asHours(since), MAX_DAYS_WITHOUT_WATER, (unsigned long)MAX_DAYS_WITHOUT_WATER * 24UL);
+  if (cycleActive) {
+    Serial.printf("cycle: ON, %lu of max %d waterings; stops when the average reads above %d%%\n",
+                  (unsigned long)cycleWaterings, MAX_CYCLE_WATERINGS, WATER_STOP_PCT);
+  } else if (clockSynced && nowUtc() < nextCycleAllowedUtc()) {
+    Serial.printf("cycle: off; next one allowed %s (one per %d h), when the average reads %d%% or below\n",
+                  fmtLocal(nextCycleAllowedUtc()).c_str(), MIN_HOURS_BETWEEN_CYCLES, WATER_START_PCT);
+  } else {
+    Serial.printf("cycle: off; starts when the average reads %d%% or below\n", WATER_START_PCT);
+  }
   if (clockSynced) {
     Serial.printf("last watered: %s   total waterings: %lu\n",
                   fmtUtc(nowUtc() - since, true).c_str(), (unsigned long)wateringCount);
@@ -1043,9 +1094,10 @@ static void printStatus() {
 }
 
 static void printSettings() {
-  logMsg("settings: controller checks every %d h from 00:00 %s; relay DRY %d min from %d s before | dry below %d%% (averaged over %d s) | min gap %d h | forced after %d days",
-       CHECK_EVERY_H, LOCAL_TZ, WATER_DURATION_MIN, WATER_LEAD_S, DRY_THRESHOLD_PCT,
-       DECISION_WINDOW_S, MIN_HOURS_BETWEEN_WATERING, MAX_DAYS_WITHOUT_WATER);
+  logMsg("settings: controller checks every %d h from 00:00 %s; relay DRY %d min from %d s before | forced after %d days",
+       CHECK_EVERY_H, LOCAL_TZ, WATER_DURATION_MIN, WATER_LEAD_S, MAX_DAYS_WITHOUT_WATER);
+  logMsg("settings: cycle starts at <= %d%%, waters every check until > %d%% or %d waterings; max one cycle per %d h (%d s averages)",
+       WATER_START_PCT, WATER_STOP_PCT, MAX_CYCLE_WATERINGS, MIN_HOURS_BETWEEN_CYCLES, DECISION_WINDOW_S);
   logMsg("settings: Wi-Fi \"%s\" | web port %d, http://%s.local/ | OTA %s | clock from %s (fallback %s), resync every %d h",
        WIFI_SSID, WEB_PORT, MDNS_NAME,
 #ifdef OTA_PASSWORD
@@ -1060,9 +1112,11 @@ static void printSettings() {
   for (int i = 0; i < MAX_SENSORS; i++) {
     if (!SENSORS[i].fitted) continue;
     fitted++;
-    logMsg("settings: sensor A%d fitted, dry=%u wet=%u (valid %d-%d); %d%% = raw %ld",
-           i, SENSORS[i].rawDry, SENSORS[i].rawWet, RAW_VALID_MIN, RAW_VALID_MAX, DRY_THRESHOLD_PCT,
-           (long)SENSORS[i].rawDry - ((long)SENSORS[i].rawDry - SENSORS[i].rawWet) * DRY_THRESHOLD_PCT / 100);
+    long span = (long)SENSORS[i].rawDry - SENSORS[i].rawWet;
+    logMsg("settings: sensor A%d fitted, dry=%u wet=%u (valid %d-%d); %d%% = raw %ld, %d%% = raw %ld",
+           i, SENSORS[i].rawDry, SENSORS[i].rawWet, RAW_VALID_MIN, RAW_VALID_MAX,
+           WATER_START_PCT, (long)SENSORS[i].rawDry - span * WATER_START_PCT / 100,
+           WATER_STOP_PCT, (long)SENSORS[i].rawDry - span * WATER_STOP_PCT / 100);
   }
   if (fitted == 0) logMsg("WARNING: no sensors marked fitted; only the fallback timer will water");
   logMsg("settings: relay pin %d active-%s | heartbeat %ds | TIME_SCALE %d (1 h = %lus)",
@@ -1322,7 +1376,9 @@ static void publishWeb() {
   w.nextSlotUtc = clockSynced && pending != PENDING_NONE ? nextSlotUtc() : 0;
   w.lastWateredUtc = clockSynced && wateringCount > 0 ? nowUtc() - since : 0;
   w.wateringCount = wateringCount;
-  w.dryAllowedInS = MIN_GAP_S - min(since, MIN_GAP_S);
+  w.cycleActive = cycleActive;
+  w.cycleWaterings = cycleWaterings;
+  w.nextCycleAllowedUtc = clockSynced && nowUtc() < nextCycleAllowedUtc() ? nextCycleAllowedUtc() : 0;
   w.forcedInS = MAX_GAP_S - min(since, MAX_GAP_S);
 
   w.hourlyCount = hourlyCount;
@@ -1408,11 +1464,14 @@ void setup() {
     since = prefs.getULong("since_s", 0);
     logMsg("flash: restored counter, %.1f h since last watering", asHours(since));
   } else {
-    // First boot: allow a watering on the first dry reading.
-    since = MIN_GAP_S;
-    logMsg("flash: no saved counter (first boot); starting at %.1f h so a dry reading can queue",
-         asHours(since));
+    since = 0;
+    logMsg("flash: no saved counter (first boot); counting from now");
   }
+  cycleActive = prefs.getBool("cycle", false);
+  cycleWaterings = prefs.getULong("cycle_n", 0);
+  cycleStartedUtc = prefs.getLong64("cycle_start", 0);
+  prefs.remove("cycle_pause");
+  if (cycleActive) logMsg("flash: watering cycle in progress, %lu waterings so far", (unsigned long)cycleWaterings);
   restoredLastWaterUtc = prefs.getLong64("water_utc", 0);
   if (restoredLastWaterUtc > 0) {
     logMsg("flash: last watering was %s; applied once the clock is set", fmtUtc(restoredLastWaterUtc, true).c_str());
@@ -1425,7 +1484,7 @@ void setup() {
   wateringCount = prefs.getULong("count", 0);
   logMsg("flash: %lu waterings so far", (unsigned long)wateringCount);
   if (prefs.getBool("session", false)) {
-    logMsg("WARNING: a watering was cut short by a reset; not counted, not repeated this hour");
+    logMsg("WARNING: a watering was cut short by a reset; not counted, not repeated at this check");
     prefs.putBool("session", false);
   }
   lastWaterAt = uptimeS() - (int64_t)since;
@@ -1502,6 +1561,7 @@ void loop() {
     logMsg("fallback: %d days without watering", MAX_DAYS_WITHOUT_WATER);
     setPending(PENDING_FORCED);
   }
+  cycleTick();
   runSlot();
   historyTick();
   hourlyTick();

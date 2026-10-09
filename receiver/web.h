@@ -6,7 +6,7 @@ enum PendingReason : uint8_t { PENDING_NONE, PENDING_DRY, PENDING_FORCED, PENDIN
 
 inline const char *pendingName(PendingReason r) {
   switch (r) {
-    case PENDING_DRY: return "soil dry";
+    case PENDING_DRY: return "watering cycle";
     case PENDING_FORCED: return "fallback: max days without water";
     case PENDING_MANUAL: return "manual";
     default: return "none";
@@ -65,7 +65,9 @@ struct WebSnapshot {
   int64_t nextSlotUtc;
   int64_t lastWateredUtc;
   uint32_t wateringCount;
-  uint32_t dryAllowedInS;
+  bool cycleActive;
+  uint32_t cycleWaterings;
+  int64_t nextCycleAllowedUtc;
   uint32_t forcedInS;
 
   int hourlyCount;

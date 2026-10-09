@@ -177,7 +177,7 @@ function renderCurrent() {
   const now = toS(c.time);
   document.getElementById("updated").textContent =
     (c.clockSet ? "Updated " + new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}) : "Receiver clock not set yet") +
-    " · waters below " + c.thresholdPct + "%";
+    " · waters at " + c.startPct + "% or below, until above " + c.stopPct + "%";
   const r = c.reading;
   document.getElementById("avg").textContent = r && r.avg !== null ? r.avg + "%" : "–";
   document.getElementById("avg-label").textContent = r
@@ -197,8 +197,10 @@ function renderCurrent() {
   tiles.appendChild(tile("Watering", state, stateNote));
   tiles.appendChild(tile("Last watered", w.lastWatered && now ? ago(now - toS(w.lastWatered)) : "Unknown",
     w.lastWatered ? fmtFull(toS(w.lastWatered)) : ""));
-  tiles.appendChild(tile("Next allowed", w.dryAllowedInS > 0 ? inS(w.dryAllowedInS) : "When dry",
-    "forced " + inS(w.forcedInS)));
+  const cy = w.cycle;
+  if (cy.active) tiles.appendChild(tile("Watering cycle", "On", cy.waterings + " of max " + cy.maxWaterings + " waterings, until above " + c.stopPct + "%"));
+  else if (cy.nextAllowed) tiles.appendChild(tile("Watering cycle", "Off", "one per day; next allowed " + fmtTime(toS(cy.nextAllowed))));
+  else tiles.appendChild(tile("Watering cycle", "Off", "starts at " + c.startPct + "% or below; forced " + inS(w.forcedInS)));
 }
 
 function buildPoints() {
@@ -240,10 +242,11 @@ function renderChart() {
     el("text", {x: x(t), y: H - 8, "text-anchor": "middle", class: "tick"}, svg).textContent = label;
   }
 
-  const thr = current ? current.thresholdPct : null;
-  if (thr !== null) {
-    el("line", {x1: m.l, x2: m.l + pw, y1: y(thr), y2: y(thr), stroke: "var(--text-secondary)", "stroke-width": 1}, svg);
-    el("text", {x: m.l + 6, y: y(thr) - 6, class: "ref-label"}, svg).textContent = "Waters below " + thr + "%";
+  if (current) {
+    for (const [v, label] of [[current.startPct, "Start watering at " + current.startPct + "%"], [current.stopPct, "Stop above " + current.stopPct + "%"]]) {
+      el("line", {x1: m.l, x2: m.l + pw, y1: y(v), y2: y(v), stroke: "var(--text-secondary)", "stroke-width": 1}, svg);
+      el("text", {x: m.l + 6, y: y(v) - 6, class: "ref-label"}, svg).textContent = label;
+    }
   }
 
   points = buildPoints().filter(p => p.t >= t0);
